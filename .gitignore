@@ -1,0 +1,10 @@
+# local settings and caches, never part of the repository
+.env
+work/
+logs/
+*.log
+*.bak
+*.orig
+*.rej
+__pycache__/
+.cache/
