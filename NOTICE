@@ -36,11 +36,4 @@ Qwen3.8-Flash-Next
   https://huggingface.co/Qwen/Qwen3.8-Flash-Next
   By the Qwen team (Alibaba). Qwen Community License 1.0.
 
-Layout
-  The launcher layout (start.sh, stop.sh, scripts/config.sh, scripts/prepare.sh, a config
-  table, and a LIVE line after a smoke test) follows MiaAI-Lab's single-Spark TensorFold
-  recipe as a layout only:
-  https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold
-  This repository does not include TensorFold, its engine, or its measurements.
-
 See CREDITS.md.
