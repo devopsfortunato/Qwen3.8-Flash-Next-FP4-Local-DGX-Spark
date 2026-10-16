@@ -18,9 +18,8 @@ command: `VLLM_PLE_TABLE_MEMORY=disk` and a 262,144-token window.
 
 `./start.sh` prepares the machine on the first run and starts the server. `./stop.sh` stops it.
 
-> **Status:** early release. The scripts pass `shellcheck` and `scripts/test_config.sh` in CI, and the flags
-> follow NVIDIA's model card for DGX Spark. Tokens/s numbers are not published yet. Please open an issue with your
-> `docker logs` if a launch fails on your Spark.
+> **Status:** tested on one DGX Spark (GB10, 121 GB unified memory). At a 256k context: prefill 1,881 t/s,
+> decode 35 t/s, TTFT 139 s. See [Benchmarks](#benchmarks).
 
 ## Quick start
 
@@ -157,6 +156,36 @@ The container also receives the rest of the model-card Spark environment:
 `--compilation-config '{"pass_config":{"fuse_act_quant":true}}'`.
 
 `DRY_RUN=1 ./start.sh` prints the exact `docker run` line for the current settings.
+
+## Benchmarks
+
+One GB10 (121 GB unified memory), 262,144-token window, cold prefill, 128-token decode, measured as client
+wall-clock on the same prose ladder. Each value is the peak of the recorded runs. The comparison is against the
+same Qwen3.8-Flash-Next model served as INT4 on MiaAI-Lab's TensorFold recipe.
+
+| Context | FP4 prefill t/s | TF prefill t/s | FP4 decode t/s | TF decode t/s | FP4 TTFT | TF TTFT |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.5k | 1,054 | 1,737 | 39.5 | 59.1 | 0.53 s | 0.32 s |
+| 1k | 1,293 | 2,051 | 36.4 | 53.1 | 0.72 s | 0.45 s |
+| 2k | 1,692 | 1,540 | 34.4 | 46.7 | 1.29 s | 1.41 s |
+| 4k | 1,858 | 2,378 | 34.6 | 45.0 | 2.27 s | 1.77 s |
+| 8k | 1,961 | 2,495 | 35.2 | 50.1 | 4.22 s | 3.32 s |
+| 16k | 2,002 | 2,459 | 34.5 | 47.7 | 8.22 s | 6.70 s |
+| 32k | 2,044 | 2,386 | 37.5 | 45.1 | 16.0 s | 13.7 s |
+| 64k | 2,035 | 2,288 | 32.9 | 28.8 | 32.1 s | 28.5 s |
+| 128k | 1,987 | 2,171 | 34.4 | 26.3 | 65.6 s | 60.0 s |
+| 256k | 1,881 | 1,970 | 34.7 | 38.2 | 138.6 s | 132.3 s |
+
+FP4 decode holds steady at about 35 t/s at every depth. TensorFold INT4 is faster up to 32k, drops to
+26 to 29 t/s at 64k to 128k, and the two are close on prefill at 256k.
+
+![Context sweep](docs/context-sweep.png)
+
+On tool-eval-bench (92 scenarios, temperature 0, seed 42), FP4-Local scores 90 quality versus 85, with a median
+tool-call TTFT of 245 ms versus 526 ms. It leads on structured output (83 vs 40), hard mode, and safety, and
+trails on context and state and on creative composition.
+
+![FP4-Local vs TensorFold INT4](docs/fp4-vs-tensorfold.png)
 
 ## Troubleshooting
 
