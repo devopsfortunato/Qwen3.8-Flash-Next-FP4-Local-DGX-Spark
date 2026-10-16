@@ -1,6 +1,11 @@
 <h1 align="center">Qwen3.8 Flash Next FP4 Local</h1>
 <p align="center">on one DGX Spark</p>
-<p align="center">by <a href="https://github.com/MovieMaker93">Alfonso Fortunato</a> / <a href="https://github.com/MovieMaker93">MovieMaker93</a></p>
+<p align="center">by <a href="https://github.com/devopsfortunato">Alfonso Fortunato</a> / <a href="https://github.com/devopsfortunato">@devopsfortunato</a></p>
+<p align="center">
+  <a href="https://github.com/devopsfortunato/Qwen3.8-Flash-Next-FP4-Local-DGX-Spark/actions/workflows/ci.yml"><img src="https://github.com/devopsfortunato/Qwen3.8-Flash-Next-FP4-Local-DGX-Spark/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
+  <img src="https://img.shields.io/badge/hardware-DGX%20Spark%20(GB10)-76B900" alt="DGX Spark">
+</p>
 
 Serve **nvidia/Qwen3.8-Flash-Next-FP4-Local** from one NVIDIA DGX Spark through an OpenAI-compatible API.
 The server is vLLM, in the container `eugr/spark-vllm-b12x:latest`, with the DGX Spark flags from the
@@ -13,10 +18,14 @@ command: `VLLM_PLE_TABLE_MEMORY=disk` and a 262,144-token window.
 
 `./start.sh` prepares the machine on the first run and starts the server. `./stop.sh` stops it.
 
+> **Status:** early release. The scripts pass `shellcheck` and `scripts/test_config.sh` in CI, and the flags
+> follow NVIDIA's model card for DGX Spark. Tokens/s numbers are not published yet. Please open an issue with your
+> `docker logs` if a launch fails on your Spark.
+
 ## Quick start
 
 ```bash
-git clone https://github.com/MovieMaker93/Qwen3.8-Flash-Next-FP4-Local-DGX-Spark.git
+git clone https://github.com/devopsfortunato/Qwen3.8-Flash-Next-FP4-Local-DGX-Spark.git
 cd Qwen3.8-Flash-Next-FP4-Local-DGX-Spark
 ./start.sh
 ```
@@ -148,6 +157,20 @@ The container also receives the rest of the model-card Spark environment:
 `--compilation-config '{"pass_config":{"fuse_act_quant":true}}'`.
 
 `DRY_RUN=1 ./start.sh` prints the exact `docker run` line for the current settings.
+
+## Troubleshooting
+
+- **401 / gated repo during download.** Accept the terms on the
+  [model page](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local), then set `HF_TOKEN`.
+- **`MemAvailable` too low.** Stop other containers or models (`docker ps`), drop page cache with
+  `sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches`, or run with `MEM_CHECK=0` to only warn.
+- **Port 8000 already in use.** `PORT=9000 ./start.sh`, or `./start.sh restart` if it is this recipe's container.
+- **Out of memory while loading.** Lower `GPU_MEMORY_UTILIZATION` (for example `0.75`) or `MAX_MODEL_LEN`
+  (`131072`).
+- **Slow first start.** The first load compiles kernels and reads about 96 GiB; later starts are faster. Follow it
+  with `docker logs -f qwen38-flash-next-fp4`.
+- **Unknown quantization or load format.** You are not on `eugr/spark-vllm-b12x`; upstream vLLM cannot read this
+  checkpoint's NVFP4 scales yet. Keep the default `IMAGE`.
 
 ## Checks
 
