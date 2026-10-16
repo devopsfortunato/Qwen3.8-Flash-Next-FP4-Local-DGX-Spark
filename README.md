@@ -187,6 +187,46 @@ trails on context and state and on creative composition.
 
 ![FP4-Local vs TensorFold INT4](docs/fp4-vs-tensorfold.png)
 
+### Tool eval
+
+[tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench) v2.7.1.dev14, 92 scenarios, temperature 0, one run,
+same GB10 and 262,144-token window. FP4-Local is NVIDIA's quant of the original top-10 model. TensorFold INT4 is
+the healed top-5 cut, not a second quant of that checkpoint.
+
+| Metric | FP4-Local | TensorFold INT4 |
+| --- | --- | --- |
+| Final score | **90 / 100** (Excellent) | 85 / 100 (Good) |
+| Points | 166 / 184 | 155 / 182 |
+| Passed / partial / fail | 78 / 10 / 4 | 71 / 13 / 8 |
+| Quality | 90 | 85 |
+| Responsiveness | 40 | 51 |
+| Deployability | 75 | 75 |
+| Median turn | 3.9 s | 3.0 s |
+| Median scenario TTFT | 245 ms | 526 ms |
+| Safety warnings | 2 | 2 |
+| Excluded (infrastructure) | 0 | 1 (TC-64) |
+| Weakest category | Context & State, 75% | Structured Output, 40% |
+| Engine | vLLM b12x | TensorFold zig-db28187 |
+
+| Category | FP4-Local | TensorFold INT4 |
+| --- | --- | --- |
+| Tool Selection | 6/6 (100%) | 6/6 (100%) |
+| Parameter Precision | 6/6 (100%) | 6/6 (100%) |
+| Multi-Step Chains | 8/8 (100%) | 8/8 (100%) |
+| Restraint & Refusal | 6/6 (100%) | 6/6 (100%) |
+| Error Recovery | 6/6 (100%) | 6/6 (100%) |
+| Localization | 6/6 (100%) | 6/6 (100%) |
+| Structured Reasoning | 6/6 (100%) | 5/6 (83%) |
+| Instruction Following | 10/10 (100%) | 10/10 (100%) |
+| Context & State | 15/20 (75%) | 20/20 (100%) |
+| Code Patterns | 6/6 (100%) | 6/6 (100%) |
+| Safety & Boundaries | 22/26 (85%) | 20/26 (77%) |
+| Toolset Scale | 7/8 (88%) | 7/8 (88%) |
+| Autonomous Planning | 5/6 (83%) | 5/6 (83%) |
+| Creative Composition | 5/6 (83%) | 6/6 (100%) |
+| Structured Output | 10/12 (83%) | 4/10 (40%) |
+| Hard Mode | 42/46 (91%) | 34/46 (74%) |
+
 ## Troubleshooting
 
 - **401 / gated repo during download.** Accept the terms on the
