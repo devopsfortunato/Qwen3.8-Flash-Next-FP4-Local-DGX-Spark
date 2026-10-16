@@ -192,7 +192,5 @@ under their own licenses. See `NOTICE`.
 - [vLLM](https://github.com/vllm-project/vllm) serves the model.
 - [eugr/spark-vllm-b12x](https://github.com/eugr/spark-vllm-docker) is the container.
 - b12x supplies the SM12x kernels that container loads.
-- [MiaAI-Lab's single-Spark TensorFold recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)
-  is the layout this launcher follows. Layout only: this recipe does not run TensorFold.
 
 The full list is in `CREDITS.md`.
