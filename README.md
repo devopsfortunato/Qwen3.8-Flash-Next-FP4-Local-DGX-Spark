@@ -10,7 +10,8 @@
 Serve **nvidia/Qwen3.8-Flash-Next-FP4-Local** from one NVIDIA DGX Spark through an OpenAI-compatible API.
 The server is vLLM, in the container `eugr/spark-vllm-b12x:latest`, with the DGX Spark flags from the
 [NVIDIA model card](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local): PLE (n-gram) tables on disk,
-`--load-format b12x`, `--quantization modelopt_mixed`, FP8 KV cache, and MTP with 4 draft tokens.
+`--load-format b12x`, `--quantization modelopt_mixed`, and FP8 KV cache. MTP drafts 3 tokens, not the model
+card's 4: on a Spark it decodes as fast and leaves about 9% more KV cache (see [Benchmarks](#benchmarks)).
 
 The checkpoint is about 96 GiB on disk. NVIDIA's model card says a DGX Spark can run it with or without PLE
 offload, and reports 1M tokens of FP8 KV cache with PLE offload. This recipe follows the model card's Spark
@@ -88,8 +89,9 @@ docker logs -f qwen38-flash-next-fp4
    (`flock` on `STATE_DIR/lifecycle.lock`). `./stop.sh` waits up to `STOP_LOCK_WAIT` seconds (30) for
    that lock and then exits without stopping anything.
 3. **Launch.** `docker run` with `--network host`, `--gpus all`, the model-card environment, and `vllm serve`.
-4. **Loading.** Wait until `/v1/models` answers. If `MemAvailable` falls below `MEM_FLOOR_GIB` (8 GiB), the
-   container is stopped.
+4. **Loading.** Wait until `/v1/models` answers. The container is stopped if `MemAvailable` stays below
+   `MEM_FLOOR_GIB` (8 GiB) for `MEM_FLOOR_GRACE` seconds (30), or falls below `MEM_HARD_FLOOR_GIB` (2 GiB).
+   Every load dips to about 4 GiB for a few seconds while vLLM profiles memory; the grace lets that pass.
 5. **Smoke test**, then the LIVE line.
 
 `FOREGROUND=1 ./start.sh` stays attached to the container log and skips the wait. Extra arguments are appended
@@ -123,10 +125,13 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | `MAX_NUM_SEQS` | `8` | sequences decoded together |
 | `MAX_NUM_BATCHED_TOKENS` | `4096` | chunked-prefill token cap |
 | `GPU_MEMORY_UTILIZATION` | `0.8` | fraction of GPU memory vLLM may use |
+| `KV_CACHE_MEMORY_BYTES` | empty | KV pool in bytes (`--kv-cache-memory-bytes`); replaces the utilization sizing |
+| `YARN_FACTOR` | empty | YaRN rope scaling past 262,144 positions; `4` allows a 1,048,576 window |
+| `PROFILE` | empty | opt-in launch profile from `profiles/` (see [Profiles](#profiles)) |
 | `KV_CACHE_DTYPE` | `fp8` | KV cache dtype |
 | `QUANTIZATION` | `modelopt_mixed` | `--quantization` |
 | `LOAD_FORMAT` | `b12x` | `--load-format` |
-| `MTP_TOKENS` | `4` | MTP draft tokens; `0` omits `--speculative-config` |
+| `MTP_TOKENS` | `3` | MTP draft tokens; `0` omits `--speculative-config` |
 | `BLOCK_SIZE` | `16` | KV block size |
 | `DTYPE` | `bfloat16` | model dtype |
 | `VLLM_PLE_TABLE_MEMORY` | `disk` | n-gram table on disk, as on the model card |
@@ -134,7 +139,8 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | `CUTE_DSL_ARCH` | `sm_121a` | GB10 architecture for the CuTe DSL kernels |
 | `HF_CACHE` | `~/.cache/huggingface` | where the checkpoint is stored |
 | `MEM_NEED_GIB` | `90` | `MemAvailable` `start.sh` asks for before launch |
-| `MEM_FLOOR_GIB` | `8` | stop the load if free memory falls below this |
+| `MEM_FLOOR_GIB` | `8` | stop the load if free memory stays below this for `MEM_FLOOR_GRACE` (30 s) |
+| `MEM_HARD_FLOOR_GIB` | `2` | stop the load at once below this |
 | `MIN_FREE_GB` | `120` | disk `prepare.sh` asks for when the snapshot is absent |
 | `IMAGE_FREE_GB` | `30` | disk asked for when the image is not local |
 | `CONTAINER_NAME` | `qwen38-flash-next-fp4` | docker name |
