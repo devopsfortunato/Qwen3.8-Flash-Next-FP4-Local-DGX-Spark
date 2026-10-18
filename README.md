@@ -353,8 +353,8 @@ and constrained decoding keeps those answers valid JSON. The weights are the sam
 `fast` 89 · 91 and 89 · 89, hibrid48 91 · 91, TensorFold 86 · 86 (TC-64 excluded as a server error). 2.8.1 adds
 five document-workflow Hard Mode scenarios and fixes grading in many others. hibrid48 moved most, and mostly
 in its first run (86), which also called `run_code` in TC-03 and TC-17 when the task did not ask for it. Its
-second run passed both. Those two scenarios flip from run to run on the vLLM recipes, so one run is not enough
-to rank recipes 2 points apart.
+second run passed both. TC-17 flips between runs for `quality` too, so one run is not enough to rank recipes
+2 points apart.
 
 ![tool-eval-bench by category](docs/four-tool-eval.png)
 
