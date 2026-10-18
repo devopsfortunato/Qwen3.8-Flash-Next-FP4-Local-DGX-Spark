@@ -22,11 +22,12 @@ unset_recipe() {
     VLLM_WORKER_MULTIPROC_METHOD VLLM_SSM_CONV_STATE_LAYOUT VLLM_USE_AOT_COMPILE \
     VLLM_USE_MEGA_AOT_ARTIFACT VLLM_USE_V2_MODEL_RUNNER B12X_POLICY_MODE \
     VLLM_MXFP8_LM_HEAD VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE VLLM_B12X_MOE_FP4_FORCE_A16 \
-    B12X_W4A16_A4_PREFILL HF_HUB_OFFLINE HF_TOKEN HF_HOME HF_CACHE VLLM_CACHE \
+    B12X_W4A16_A4_PREFILL PRECISION B12X_W4A16_A4_PREFILL_TERMS VLLM_B12X_DENSE_ACTIVATION_MODE \
+    HF_HUB_OFFLINE HF_TOKEN HF_HOME HF_CACHE VLLM_CACHE \
     FLASHINFER_CACHE TRITON_CACHE B12X_CACHE STATE_DIR LOG_DIR MIN_FREE_GB IMAGE_FREE_GB \
     MEM_NEED_GIB MEM_FLOOR_GIB MEM_FLOOR_GRACE MEM_HARD_FLOOR_GIB MEM_CHECK WAIT_TIMEOUT STOP_TIMEOUT \
     STOP_LOCK_WAIT PREPARE PULL DRY_RUN FOREGROUND PROFILE PROFILE_DIR PROFILE_FILE \
-    KV_CACHE_MEMORY_BYTES YARN_FACTOR NATIVE_MAX_LEN || true
+    KV_CACHE_MEMORY_BYTES YARN_FACTOR NATIVE_MAX_LEN EXTRA_ENV || true
 }
 
 has_pair() {
@@ -66,6 +67,9 @@ check_defaults() {
   [[ "${CUTE_DSL_ARCH}" == "sm_121a" ]] || return 1
   [[ "${VLLM_B12X_MOE_FP4_FORCE_A16}" == "1" ]] || return 1
   [[ "${B12X_W4A16_A4_PREFILL}" == "1" ]] || return 1
+  [[ "${PRECISION}" == "quality" ]] || return 1
+  [[ "${B12X_W4A16_A4_PREFILL_TERMS}" == "2" ]] || return 1
+  [[ "${VLLM_B12X_DENSE_ACTIVATION_MODE}" == "a16" ]] || return 1
 }
 
 check_cmd() {
@@ -113,6 +117,8 @@ check_cmd() {
   has_word "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13" || return 1
   has_word "VLLM_B12X_MOE_FP4_FORCE_A16=1" || return 1
   has_word "B12X_W4A16_A4_PREFILL=1" || return 1
+  has_word "B12X_W4A16_A4_PREFILL_TERMS=2" || return 1
+  has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=a16" || return 1
   has_word "--speculative-config" || return 1
   has_word '{"method":"mtp","num_speculative_tokens":3}' || return 1
   has_word --kv-cache-memory-bytes && return 1
@@ -185,7 +191,11 @@ pass "environment wins over .env"
   # shellcheck source=scripts/config.sh
   source "${CONFIG}"
   validate_config
+  EXTRA_ENV="B12X_TEST_A=1 B12X_TEST_B=two"
+  validate_config
   build_docker_cmd --max-num-seqs 2
+  has_pair -e B12X_TEST_A=1
+  has_pair -e B12X_TEST_B=two
   has_pair --port 9001
   has_word "VLLM_PLE_TABLE_MEMORY=gpu"
   has_pair --kv-cache-dtype bfloat16
@@ -199,6 +209,30 @@ pass "environment wins over .env"
   fi
 )
 pass "environment overrides reach the docker command and the token stays off the command line"
+
+(
+  unset_recipe
+  PRECISION=fast
+  export PRECISION
+  cd "${tmp}"
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  validate_config
+  build_docker_cmd
+  has_word "B12X_W4A16_A4_PREFILL_TERMS=1"
+  has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=auto"
+)
+(
+  unset_recipe
+  PRECISION=fast VLLM_B12X_DENSE_ACTIVATION_MODE=a16
+  export PRECISION VLLM_B12X_DENSE_ACTIVATION_MODE
+  cd "${tmp}"
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  [[ "${B12X_W4A16_A4_PREFILL_TERMS}" == "1" ]]
+  [[ "${VLLM_B12X_DENSE_ACTIVATION_MODE}" == "a16" ]]
+)
+pass "PRECISION=fast restores the model-card activations, and a variable set directly wins"
 
 prof_dir="${tmp}/profiles"
 mkdir -p "${prof_dir}"
@@ -271,8 +305,12 @@ for bad in \
   'MAX_MODEL_LEN=1048576' \
   'YARN_FACTOR=0' \
   'KV_CACHE_MEMORY_BYTES=30G' \
+  'PRECISION=max' \
+  'B12X_W4A16_A4_PREFILL_TERMS=3' \
+  'VLLM_B12X_DENSE_ACTIVATION_MODE=bf16' \
   'MEM_HARD_FLOOR_GIB=9' \
   'PROFILE=no-such-profile' \
+  'EXTRA_ENV=not-a-pair' \
   'PREPARE=maybe' \
   'MODEL_ID=not-a-repo'
 do

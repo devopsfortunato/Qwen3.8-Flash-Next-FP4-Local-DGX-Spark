@@ -11,7 +11,12 @@ Serve **nvidia/Qwen3.8-Flash-Next-FP4-Local** from one NVIDIA DGX Spark through 
 The server is vLLM, in the container `eugr/spark-vllm-b12x:latest`, with the DGX Spark flags from the
 [NVIDIA model card](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local): PLE (n-gram) tables on disk,
 `--load-format b12x`, `--quantization modelopt_mixed`, and FP8 KV cache. MTP drafts 3 tokens, not the model
-card's 4: on a Spark it decodes as fast and leaves about 9% more KV cache (see [Benchmarks](#benchmarks)).
+card's 4: on a Spark it decodes as fast and leaves 4-9% more KV cache (see [Benchmarks](#benchmarks)).
+
+Two activation settings differ from the model card. Prefill MoE activations carry a second FP4 term for the
+rounding residual, and the dense NVFP4/MXFP8 layers keep BF16 activations. Token by token this tracks a
+full-precision run about twice as closely as the model card's settings, at about 21% less prefill speed.
+`PRECISION=fast` restores the model card's settings (see [Precision](#precision)).
 
 The checkpoint is about 96 GiB on disk. NVIDIA's model card says a DGX Spark can run it with or without PLE
 offload, and reports 1M tokens of FP8 KV cache with PLE offload. This recipe follows the model card's Spark
@@ -19,8 +24,8 @@ command: `VLLM_PLE_TABLE_MEMORY=disk` and a 262,144-token window.
 
 `./start.sh` prepares the machine on the first run and starts the server. `./stop.sh` stops it.
 
-> **Status:** tested on one DGX Spark (GB10, 121 GB unified memory). At a 256k context: prefill 1,881 t/s,
-> decode 35 t/s, TTFT 139 s. See [Benchmarks](#benchmarks).
+> **Status:** tested on one DGX Spark (GB10, 121 GB unified memory). At a 128k prose context: prefill
+> 1,515 t/s, decode 38 t/s, TTFT 86 s (`PRECISION=fast`: 1,990 t/s, 39 t/s, 66 s). See [Benchmarks](#benchmarks).
 
 ## Quick start
 
@@ -91,7 +96,8 @@ docker logs -f qwen38-flash-next-fp4
 3. **Launch.** `docker run` with `--network host`, `--gpus all`, the model-card environment, and `vllm serve`.
 4. **Loading.** Wait until `/v1/models` answers. The container is stopped if `MemAvailable` stays below
    `MEM_FLOOR_GIB` (8 GiB) for `MEM_FLOOR_GRACE` seconds (30), or falls below `MEM_HARD_FLOOR_GIB` (2 GiB).
-   Every load dips to about 4 GiB for a few seconds while vLLM profiles memory; the grace lets that pass.
+   Every load dips to about 4 GiB for up to 10 seconds while vLLM repacks the loaded weights; the grace
+   lets that pass.
 5. **Smoke test**, then the LIVE line.
 
 `FOREGROUND=1 ./start.sh` stays attached to the container log and skips the wait. Extra arguments are appended
@@ -128,6 +134,9 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | `KV_CACHE_MEMORY_BYTES` | empty | KV pool in bytes (`--kv-cache-memory-bytes`); replaces the utilization sizing |
 | `YARN_FACTOR` | empty | YaRN rope scaling past 262,144 positions; `4` allows a 1,048,576 window |
 | `PROFILE` | empty | opt-in launch profile from `profiles/` (see [Profiles](#profiles)) |
+| `PRECISION` | `quality` | activation precision; `fast` is the model card's (see [Precision](#precision)) |
+| `B12X_W4A16_A4_PREFILL_TERMS` | `2` (`fast`: `1`) | FP4 terms for prefill MoE activations |
+| `VLLM_B12X_DENSE_ACTIVATION_MODE` | `a16` (`fast`: `auto`) | activations of the dense NVFP4/MXFP8 layers |
 | `KV_CACHE_DTYPE` | `fp8` | KV cache dtype |
 | `QUANTIZATION` | `modelopt_mixed` | `--quantization` |
 | `LOAD_FORMAT` | `b12x` | `--load-format` |
@@ -153,7 +162,8 @@ The container also receives the rest of the model-card Spark environment:
 `SAFETENSORS_FAST_GPU=1`, `VLLM_WORKER_MULTIPROC_METHOD=spawn`, `VLLM_SSM_CONV_STATE_LAYOUT=DS`,
 `VLLM_USE_AOT_COMPILE=1`, `VLLM_USE_MEGA_AOT_ARTIFACT=1`, `VLLM_USE_V2_MODEL_RUNNER=1`,
 `B12X_POLICY_MODE=auto`, `VLLM_MXFP8_LM_HEAD=1`, `VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13`,
-`VLLM_B12X_MOE_FP4_FORCE_A16=1`, `B12X_W4A16_A4_PREFILL=1`.
+`VLLM_B12X_MOE_FP4_FORCE_A16=1`, `B12X_W4A16_A4_PREFILL=1`. `B12X_W4A16_A4_PREFILL_TERMS` and
+`VLLM_B12X_DENSE_ACTIVATION_MODE` come from `PRECISION`.
 
 `vllm serve` is started with `--enable-prefix-caching`, `--enable-chunked-prefill`,
 `--mamba-cache-mode align`, `--gdn-decode-kernel b12x`, `--linear-backend b12x`, `--moe-backend b12x`,
@@ -163,7 +173,106 @@ The container also receives the rest of the model-card Spark environment:
 
 `DRY_RUN=1 ./start.sh` prints the exact `docker run` line for the current settings.
 
+## Profiles
+
+A profile is a `profiles/NAME.env` file of `KEY=value` lines, loaded with `PROFILE=NAME ./start.sh`. It is
+read as data, and `.env` and the environment still win over it. The default needs no profile.
+
+| Profile | Window | KV pool | FP8 KV tokens | Full windows at once | Notes |
+| --- | ---: | --- | ---: | ---: | --- |
+| none | 262,144 | 0.8 utilization | 1.03-1.06M | 4.0 | the default |
+| `kv-max` | 262,144 | 34 GB | 1,719,161 | 6.6 | lowest `MemAvailable` while serving 5.5 GiB; floor 4 GiB |
+| `1m` | 1,048,576 | 30 GB | 1,931,132 | 1.8 | test profile: YaRN 4x, floor 4 GiB |
+
+`kv-max` changes only the pool size, so it answers exactly like the default. Leave nothing else big running on
+the Spark with it, or lower `KV_CACHE_MEMORY_BYTES`.
+
+`1m` stretches the checkpoint's 262,144 positions 4x with YaRN, which changes every answer, short ones included.
+A needle hidden in 524,288 and in 1,040,000 tokens of text was found 5 times out of 5 at each length.
+tool-eval-bench scored 89 (default: 89 and 91), and perplexity on fresh text rose from 2.205 to 2.248. These
+`1m` numbers were measured with `PRECISION=fast`. Use it when a window past 262,144 matters more than the last
+bit of quality.
+
+## Precision
+
+`PRECISION=quality` (the default) sets `B12X_W4A16_A4_PREFILL_TERMS=2` and
+`VLLM_B12X_DENSE_ACTIVATION_MODE=a16`. `PRECISION=fast` sets `1` and `auto`, the model card's values. Either
+variable set directly wins over `PRECISION`.
+
+Each setting was compared token by token with the most precise run the image allows: BF16 KV cache, BF16
+prefill activations, BF16 dense activations, and a BF16 LM head. The texts are book prose, code, a 96k-token
+book and two fresh 2026 texts the model cannot have seen, 156,000 tokens in all. That run's own repeat-to-repeat
+difference is 0.024, because its BF16 kernels are not deterministic.
+
+| Setting | Mean \|Δ logprob\| | Top-1 agreement | Repeat runs | Prefill t/s |
+| --- | ---: | ---: | --- | ---: |
+| `quality` (default) | **0.020** | **99.23%** | bit-identical | 1,362 |
+| `fast` (model card) | 0.039 | 98.59% | bit-identical | 1,718 |
+| `B12X_W4A16_A4_PREFILL_TERMS=2` alone | 0.028 | 98.93% | bit-identical | 1,665 |
+| BF16 prefill activations (`B12X_W4A16_A4_PREFILL=0`) | 0.028 | 98.92% | differ | 1,625 |
+| `VLLM_B12X_DENSE_ACTIVATION_MODE=a16` alone | 0.037 | 98.67% | bit-identical | 1,386 |
+| BF16 LM head (`VLLM_MXFP8_LM_HEAD=0`) | 0.039 | 98.63% | bit-identical | decode -6% |
+
+Measured as a shipping default, `quality` against `fast` on the same image:
+
+| | `quality` | `fast` |
+| --- | ---: | ---: |
+| tool-eval-bench, two runs | 90 · 91 | 89 · 91 |
+| Perplexity, book prose and code (40k tokens) | 1.0849 | 1.0902 |
+| Perplexity, 96k-token book | 1.0418 | 1.0470 |
+| Perplexity, fresh 2026 texts (20k tokens) | 2.227 | 2.205 |
+| Decode, geometric mean, 0.5k-128k | 44.4 t/s | 45.2 t/s |
+| Prefill, geometric mean | 1,362 t/s | 1,718 t/s |
+| KV cache | 1,041,294 | 1,051,720-1,060,326 |
+
+On the fresh texts `quality` is token by token closer to the precise run too, but its perplexity there is 1%
+higher than `fast`'s (the precise run: 2.198). Everywhere else it sits at the precise run's level.
+
+Tried and left out:
+
+- **BF16 KV cache** (`KV_CACHE_DTYPE=bfloat16`): no measurable gain over FP8, and 38% less KV (656,801 tokens).
+- **`VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=0`**: bit-identical output. It changes nothing on this checkpoint.
+- **MTP 4 with block verification and a probabilistic draft**
+  (`MTP_TOKENS=4 ./start.sh --speculative-config '{"method":"mtp","num_speculative_tokens":4,"rejection_sample_method":"block","draft_sample_method":"probabilistic"}'`):
+  5-9% faster decode, but one tool-eval run with it scored 87, under this recipe's bar of 88. Try it if speed
+  matters more to you.
+- **Kernel levers** (`B12X_W4A16_SMALL_M_OCCUPANCY=2`, `VLLM_B12X_BF16_GEMV=1`, `B12X_W4A16_A4_PREFILL_WARPS=16`,
+  `--gdn-prefill-backend flashinfer`): within run-to-run noise, slower, less KV, or worse perplexity.
+
 ## Benchmarks
+
+### Against hibrid48
+
+The same Spark, back to back, thinking off, temperature 0. hibrid48 is
+[myllmbox/qwen38-flash-next-recipe](https://github.com/myllmbox/qwen38-flash-next-recipe) at `43b45e1`, serving
+its hibrid48 NVFP4 body with Marlin W4A16 MoE kernels, BF16 KV cache and MTP up to 7, on its own defaults.
+
+| | This recipe | hibrid48 |
+| --- | ---: | ---: |
+| tool-eval-bench, two runs | 90 · 91 | 91 · 91 |
+| [sixcat-eval](https://github.com/vcruz305/sixcat-eval) 0.8.3, 884 items | **91.7** | 87.8 |
+| sixcat-eval tools | **90** | 70 |
+| Perplexity, fresh 2026 texts | **2.227** | 2.247 |
+| Perplexity, book prose and code | **1.0849** | 1.0998 |
+| Perplexity, 96k-token book | **1.0418** | 1.0536 |
+| Decode, geometric mean | 44.4 t/s | **54.3 t/s** |
+| Prefill, geometric mean | 1,362 t/s | **1,936 t/s** |
+| KV cache | **1,041,294** | 876,726 |
+
+Both servers split the perplexity texts into the same tokens, so those numbers compare directly. One sixcat
+answer of this recipe ran past sixcat's token budget and was left unscored; it counts as wrong here.
+
+![This recipe vs hibrid48](docs/hibrid48-overview.png)
+
+![sixcat-eval by category](docs/hibrid48-sixcat.png)
+
+Per-category tool-eval scores and speed by context length:
+[tool-eval](docs/hibrid48-tool-eval.png), [speed](docs/hibrid48-speed.png).
+
+### Against TensorFold INT4
+
+The tables below were measured earlier with the model card's activation settings (`PRECISION=fast` today) on
+an older image.
 
 One GB10 (121 GB unified memory), 262,144-token window, cold prefill, 128-token decode, measured as client
 wall-clock on the same prose ladder. Each value is the peak of the recorded runs. The comparison is against the
@@ -264,6 +373,8 @@ stop.sh                  stop and remove the container
 scripts/config.sh        settings and build_docker_cmd
 scripts/prepare.sh       pull the image, download the checkpoint
 scripts/test_config.sh   config checks
+profiles/                opt-in launch profiles (kv-max, 1m)
+docs/                    benchmark charts
 .env.example             commented overrides
 CREDITS.md               what this builds on
 NOTICE                   third-party notices

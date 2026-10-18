@@ -64,7 +64,7 @@ KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-}"
 YARN_FACTOR="${YARN_FACTOR:-}"
 NATIVE_MAX_LEN="${NATIVE_MAX_LEN:-262144}"
 # 0 omits --speculative-config. The model card uses 4 draft tokens. 3 decodes as fast on a Spark
-# and leaves about 9% more KV cache (README, Benchmarks).
+# and leaves 4-9% more KV cache (README, Benchmarks).
 MTP_TOKENS="${MTP_TOKENS:-3}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
 GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL:-b12x}"
@@ -93,6 +93,17 @@ export VLLM_MXFP8_LM_HEAD="${VLLM_MXFP8_LM_HEAD:-1}"
 export VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE="${VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE:-w13}"
 export VLLM_B12X_MOE_FP4_FORCE_A16="${VLLM_B12X_MOE_FP4_FORCE_A16:-1}"
 export B12X_W4A16_A4_PREFILL="${B12X_W4A16_A4_PREFILL:-1}"
+# Activation precision (README, Precision). quality: prefill MoE activations are FP4 plus an FP4 residual
+# term, and the dense NVFP4/MXFP8 layers keep BF16 activations. fast: the model card's settings, one FP4
+# term and the dense format the autotuner picks for speed. Setting either variable below directly wins.
+PRECISION="${PRECISION:-quality}"
+if [[ "${PRECISION}" == fast ]]; then
+  export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-1}"
+  export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-auto}"
+else
+  export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-2}"
+  export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-a16}"
+fi
 # The serve container stays offline once the snapshot is on disk. prepare.sh turns this off for the download.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
@@ -112,8 +123,13 @@ SPARK_ENV=(
   VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE
   VLLM_B12X_MOE_FP4_FORCE_A16
   B12X_W4A16_A4_PREFILL
+  B12X_W4A16_A4_PREFILL_TERMS
+  VLLM_B12X_DENSE_ACTIVATION_MODE
   HF_HUB_OFFLINE
 )
+
+# More container environment, as space-separated NAME=value pairs: EXTRA_ENV="B12X_FOO=1 B12X_BAR=2".
+EXTRA_ENV="${EXTRA_ENV:-}"
 
 HF_CACHE="${HF_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}}"
 VLLM_CACHE="${VLLM_CACHE:-${HOME}/.cache/vllm}"
@@ -131,7 +147,7 @@ IMAGE_FREE_GB="${IMAGE_FREE_GB:-30}"
 MEM_NEED_GIB="${MEM_NEED_GIB:-90}"
 # While weights load, start.sh stops the container if MemAvailable stays below MEM_FLOOR_GIB for
 # MEM_FLOOR_GRACE seconds, or falls below MEM_HARD_FLOOR_GIB at all. The grace covers the dip of a few
-# seconds to about 4 GiB that every load goes through when vLLM profiles memory.
+# seconds to about 4 GiB that every load goes through while vLLM repacks the loaded weights.
 MEM_FLOOR_GIB="${MEM_FLOOR_GIB:-8}"
 MEM_FLOOR_GRACE="${MEM_FLOOR_GRACE:-30}"
 MEM_HARD_FLOOR_GIB="${MEM_HARD_FLOOR_GIB:-2}"
@@ -237,6 +253,15 @@ validate_config() {
   if [[ -n "${YARN_FACTOR}" ]] && { ! is_uint "${YARN_FACTOR}" || (( YARN_FACTOR < 1 || YARN_FACTOR > 16 )); }; then
     die "YARN_FACTOR is 1 to 16, not ${YARN_FACTOR}"
   fi
+  if [[ ! "${PRECISION}" =~ ^(quality|fast)$ ]]; then
+    die "PRECISION is quality or fast, not ${PRECISION}"
+  fi
+  if [[ ! "${B12X_W4A16_A4_PREFILL_TERMS}" =~ ^[12]$ ]]; then
+    die "B12X_W4A16_A4_PREFILL_TERMS is 1 or 2, not ${B12X_W4A16_A4_PREFILL_TERMS}"
+  fi
+  if [[ ! "${VLLM_B12X_DENSE_ACTIVATION_MODE}" =~ ^(auto|a16|quantized)$ ]]; then
+    die "VLLM_B12X_DENSE_ACTIVATION_MODE is auto, a16, or quantized, not ${VLLM_B12X_DENSE_ACTIVATION_MODE}"
+  fi
   if ! is_uint "${NATIVE_MAX_LEN}" || (( NATIVE_MAX_LEN < 1 )); then
     die "NATIVE_MAX_LEN is a positive integer, not ${NATIVE_MAX_LEN}"
   fi
@@ -274,6 +299,12 @@ validate_config() {
   if ! is_uint "${MEM_FLOOR_GIB}"; then
     die "MEM_FLOOR_GIB is a GiB count, not ${MEM_FLOOR_GIB}"
   fi
+  local pair
+  local -a pairs=()
+  read -r -a pairs <<< "${EXTRA_ENV}"
+  for pair in "${pairs[@]}"; do
+    [[ "${pair}" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*$ ]] || die "EXTRA_ENV holds NAME=value pairs, not ${pair}"
+  done
   if ! is_uint "${MEM_FLOOR_GRACE}"; then
     die "MEM_FLOOR_GRACE is seconds, not ${MEM_FLOOR_GRACE}"
   fi
@@ -318,6 +349,11 @@ build_docker_cmd() {
   )
   for key in "${SPARK_ENV[@]}"; do
     DOCKER_CMD+=(-e "${key}=${!key}")
+  done
+  local -a extra=()
+  read -r -a extra <<< "${EXTRA_ENV}"
+  for key in "${extra[@]}"; do
+    DOCKER_CMD+=(-e "${key}")
   done
   if [[ -n "${HF_TOKEN:-}" ]]; then
     DOCKER_CMD+=(-e HF_TOKEN)
