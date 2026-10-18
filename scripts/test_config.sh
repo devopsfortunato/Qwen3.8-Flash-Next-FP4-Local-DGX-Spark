@@ -67,9 +67,9 @@ check_defaults() {
   [[ "${CUTE_DSL_ARCH}" == "sm_121a" ]] || return 1
   [[ "${VLLM_B12X_MOE_FP4_FORCE_A16}" == "1" ]] || return 1
   [[ "${B12X_W4A16_A4_PREFILL}" == "1" ]] || return 1
-  [[ "${PRECISION}" == "quality" ]] || return 1
-  [[ "${B12X_W4A16_A4_PREFILL_TERMS}" == "2" ]] || return 1
-  [[ "${VLLM_B12X_DENSE_ACTIVATION_MODE}" == "a16" ]] || return 1
+  [[ "${PRECISION}" == "fast" ]] || return 1
+  [[ "${B12X_W4A16_A4_PREFILL_TERMS}" == "1" ]] || return 1
+  [[ "${VLLM_B12X_DENSE_ACTIVATION_MODE}" == "auto" ]] || return 1
 }
 
 check_cmd() {
@@ -117,8 +117,8 @@ check_cmd() {
   has_word "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13" || return 1
   has_word "VLLM_B12X_MOE_FP4_FORCE_A16=1" || return 1
   has_word "B12X_W4A16_A4_PREFILL=1" || return 1
-  has_word "B12X_W4A16_A4_PREFILL_TERMS=2" || return 1
-  has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=a16" || return 1
+  has_word "B12X_W4A16_A4_PREFILL_TERMS=1" || return 1
+  has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=auto" || return 1
   has_word "--speculative-config" || return 1
   has_word '{"method":"mtp","num_speculative_tokens":3}' || return 1
   has_word --kv-cache-memory-bytes && return 1
@@ -212,27 +212,27 @@ pass "environment overrides reach the docker command and the token stays off the
 
 (
   unset_recipe
-  PRECISION=fast
+  PRECISION=quality
   export PRECISION
   cd "${tmp}"
   # shellcheck source=scripts/config.sh
   source "${CONFIG}"
   validate_config
   build_docker_cmd
-  has_word "B12X_W4A16_A4_PREFILL_TERMS=1"
-  has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=auto"
+  has_word "B12X_W4A16_A4_PREFILL_TERMS=2"
+  has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=a16"
 )
 (
   unset_recipe
-  PRECISION=fast VLLM_B12X_DENSE_ACTIVATION_MODE=a16
+  PRECISION=quality VLLM_B12X_DENSE_ACTIVATION_MODE=auto
   export PRECISION VLLM_B12X_DENSE_ACTIVATION_MODE
   cd "${tmp}"
   # shellcheck source=scripts/config.sh
   source "${CONFIG}"
-  [[ "${B12X_W4A16_A4_PREFILL_TERMS}" == "1" ]]
-  [[ "${VLLM_B12X_DENSE_ACTIVATION_MODE}" == "a16" ]]
+  [[ "${B12X_W4A16_A4_PREFILL_TERMS}" == "2" ]]
+  [[ "${VLLM_B12X_DENSE_ACTIVATION_MODE}" == "auto" ]]
 )
-pass "PRECISION=fast restores the model-card activations, and a variable set directly wins"
+pass "PRECISION=quality sets the two-term prefill and BF16 dense activations, and a variable set directly wins"
 
 prof_dir="${tmp}/profiles"
 mkdir -p "${prof_dir}"

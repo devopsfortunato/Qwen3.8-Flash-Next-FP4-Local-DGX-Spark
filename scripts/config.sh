@@ -93,16 +93,17 @@ export VLLM_MXFP8_LM_HEAD="${VLLM_MXFP8_LM_HEAD:-1}"
 export VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE="${VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE:-w13}"
 export VLLM_B12X_MOE_FP4_FORCE_A16="${VLLM_B12X_MOE_FP4_FORCE_A16:-1}"
 export B12X_W4A16_A4_PREFILL="${B12X_W4A16_A4_PREFILL:-1}"
-# Activation precision (README, Precision). quality: prefill MoE activations are FP4 plus an FP4 residual
-# term, and the dense NVFP4/MXFP8 layers keep BF16 activations. fast: the model card's settings, one FP4
-# term and the dense format the autotuner picks for speed. Setting either variable below directly wins.
-PRECISION="${PRECISION:-quality}"
-if [[ "${PRECISION}" == fast ]]; then
-  export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-1}"
-  export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-auto}"
-else
+# Activation precision (README, Precision). fast (the default): the model card's settings, one FP4 term for
+# prefill MoE activations and the dense format the autotuner picks for speed. quality: an FP4 residual term on
+# top, and BF16 activations in the dense NVFP4/MXFP8 layers; closer to full precision token by token, about 21%
+# less prefill speed. Setting either variable below directly wins.
+PRECISION="${PRECISION:-fast}"
+if [[ "${PRECISION}" == quality ]]; then
   export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-2}"
   export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-a16}"
+else
+  export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-1}"
+  export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-auto}"
 fi
 # The serve container stays offline once the snapshot is on disk. prepare.sh turns this off for the download.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
