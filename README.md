@@ -278,8 +278,9 @@ built locally from its repository.
 | Decode, geometric mean, 0.5k-128k | 45.8 t/s | 44.4 t/s | **54.3 t/s** | 51.6 t/s |
 | Prefill, geometric mean | 1,717 t/s | 1,362 t/s | **1,936 t/s** | 1,858 t/s |
 | Time to first token, 128k prose | 65.5 s | 86.0 s | **60.2 s** | 63.9 s |
-| KV cache | **1,051,720 tokens** | 1,041,294 tokens | 876,726 tokens | 26.45 GiB, 5 requests |
+| KV cache | 1,051,720 tokens | 1,041,294 tokens | 876,726 tokens | **≈1.57M tokens** (26.45 GiB) |
 | Full 262k requests that fit | 4.01 | 3.97 | 3.34 | **5** (its cap) |
+| Requests decoded at once (cap) | 8 | 8 | **16** | 5 |
 
 What the numbers say:
 
@@ -289,8 +290,11 @@ What the numbers say:
 - **hibrid48 and TensorFold are faster.** hibrid48 decodes 19% faster than `fast` (54.3 against 45.8 t/s,
   geometric means) and prefills 13% faster, with MTP up to 7 and Marlin kernels. TensorFold is second (51.6 t/s,
   1,858 t/s) and the fastest of all on short code (67.9 t/s at 0.5k). All four stay above 38 t/s at 128k.
-- **This recipe holds the most context.** 1.05-1.10M tokens of FP8 KV (the exact count depends on the memory
-  free at boot), 4 full 262k windows. hibrid48 keeps BF16 KV: 877k tokens, 3.3 windows.
+- **No recipe serves the most requests at every length.** This recipe holds 1.05-1.10M tokens of FP8 KV (the
+  exact count depends on the memory free at boot) with a cap of 8: 8 requests up to about 136k each, 4 at the
+  full 262k window. hibrid48 keeps BF16 KV, 877k tokens, with a cap of 16: the most short requests, 3 full
+  windows. TensorFold takes all memory but 10 GiB, about 1.57M tokens, with a cap of 5: all 5 at full windows.
+  `PROFILE=kv-max` gives this recipe the largest pool, 1.72M tokens, 6 full windows.
 - **`quality` is the most precise, not the most useful.** It tracks a full-precision run twice as closely and
   has the lowest perplexity on book prose and code, but scores within noise of `fast` on both task benchmarks
   and prefills 21% slower.
@@ -299,12 +303,13 @@ What the numbers say:
 
 Perplexity scores the same texts through each server with prompt logprobs, and the vLLM recipes split them
 into the same tokens, so those numbers compare directly. TensorFold's server refuses logprobs, so it has no
-perplexity. It sizes its KV as 26.45 GiB of FP8 sequence memory for 5 requests at once and reports no token
-count. By its own figure of 1,056 bytes per position per layer, over the model's 12 full-attention layers,
-that is room for roughly 2.2M positions. One sixcat answer each of `fast` and `quality` ran past sixcat's
+perplexity. Its server logs 26.2-26.45 GiB of FP8 sequence memory shared by 5 requests and no token count; its
+recipe sizes a token at 17,888 bytes (4.37 GiB a full window), so the pool holds about 1.57M tokens. One sixcat answer each of `fast` and `quality` ran past sixcat's
 token budget and was left unscored; it counts as wrong here.
 
 ![Four recipes at a glance](docs/four-overview.png)
+
+![KV pool and requests decoded at once](docs/four-kv.png)
 
 ### Tool eval
 
