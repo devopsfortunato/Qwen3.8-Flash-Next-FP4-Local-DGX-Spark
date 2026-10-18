@@ -60,7 +60,7 @@ check_defaults() {
   [[ "${MTP_TOKENS}" == "3" ]] || return 1
   [[ -z "${PROFILE}" && "${KV_CACHE_MEMORY_BYTES}" == "27000000000" && -z "${YARN_FACTOR}" ]] || return 1
   [[ "${MAX_MODEL_LEN}" == "262144" ]] || return 1
-  [[ "${MAX_NUM_SEQS}" == "8" ]] || return 1
+  [[ "${MAX_NUM_SEQS}" == "5" ]] || return 1
   [[ "${GPU_MEMORY_UTILIZATION}" == "0.8" ]] || return 1
   [[ "${VLLM_PLE_TABLE_MEMORY}" == "disk" ]] || return 1
   [[ "${B12X_DISK_BACKEND}" == "io_uring" ]] || return 1
@@ -89,7 +89,7 @@ check_cmd() {
   has_pair --dtype bfloat16 || return 1
   has_pair --block-size 16 || return 1
   has_pair --max-model-len 262144 || return 1
-  has_pair --max-num-seqs 8 || return 1
+  has_pair --max-num-seqs 5 || return 1
   has_pair --max-num-batched-tokens 4096 || return 1
   has_pair --gdn-decode-kernel b12x || return 1
   has_pair --linear-backend b12x || return 1
@@ -307,6 +307,7 @@ for prof in "${ROOT}"/profiles/*.env; do
     validate_config
     build_docker_cmd
     has_pair --max-model-len "${MAX_MODEL_LEN}"
+    has_pair --max-num-seqs "${MAX_NUM_SEQS}"
   ) >/dev/null || fail "profile ${name} does not validate"
   pass "profile ${name} validates and builds"
 done

@@ -53,7 +53,9 @@ QUANTIZATION="${QUANTIZATION:-modelopt_mixed}"
 LOAD_FORMAT="${LOAD_FORMAT:-b12x}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+# Requests decoded at once. 5 matches the default KV pool, which holds five full 262,144-token requests, so
+# every running request has room to reach the full window. Requests past the cap wait for a free slot.
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-5}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
 # Bytes for the KV cache (--kv-cache-memory-bytes). 27 GB holds about 1.36M FP8 tokens: five full

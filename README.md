@@ -130,7 +130,7 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | `PORT` / `HOST` | `8000` / `0.0.0.0` | where the API listens |
 | `SERVED_NAME` | the model id | id returned by `/v1/models` |
 | `MAX_MODEL_LEN` | `262144` | prompt + reply window (`--max-model-len`) |
-| `MAX_NUM_SEQS` | `8` | sequences decoded together |
+| `MAX_NUM_SEQS` | `5` | requests decoded together; five full windows fit the default KV pool |
 | `MAX_NUM_BATCHED_TOKENS` | `4096` | chunked-prefill token cap |
 | `GPU_MEMORY_UTILIZATION` | `0.8` | fraction of GPU memory vLLM may use; sizes the KV pool only when `KV_CACHE_MEMORY_BYTES` is empty |
 | `KV_CACHE_MEMORY_BYTES` | `27000000000` | KV pool in bytes (`--kv-cache-memory-bytes`): 1,365,333 FP8 tokens. Empty uses `GPU_MEMORY_UTILIZATION` |
@@ -182,13 +182,15 @@ read as data, and `.env` and the environment still win over it. The default need
 
 | Profile | Window | KV pool | FP8 KV tokens | Full windows at once | Notes |
 | --- | ---: | --- | ---: | ---: | --- |
-| none | 262,144 | 27 GB | 1,365,333 | 5.2 | the default; lowest `MemAvailable` while serving 11.4 GiB |
-| `kv-max` | 262,144 | 34 GB | 1,719,161 | 6.6 | lowest `MemAvailable` while serving 5.5 GiB; floor 4 GiB |
+| none | 262,144 | 27 GB | 1,365,333 | 5.2 | the default; cap 5; lowest `MemAvailable` while serving 11.4 GiB |
+| `kv-max` | 262,144 | 34 GB | 1,719,161 | 6.6 | cap 6; lowest `MemAvailable` while serving 4.4 GiB; floor 4 GiB |
 | `1m` | 1,048,576 | 30 GB | 1,931,132 | 1.8 | test profile: YaRN 4x, floor 4 GiB |
 
-The default pool is pinned at 27 GB, so five full 262,144-token requests decode at once. It used to be sized at
-0.8 of memory: 1.05-1.10M tokens, 4 full windows, drifting by about 0.7 GiB between boots. An empty
-`KV_CACHE_MEMORY_BYTES=` brings that sizing back. Checks on the 27 GB default:
+The default pool is pinned at 27 GB, so five full 262,144-token requests decode at once, and the request cap is
+5 to match: every running request has room to reach the full window, and a sixth waits for a free slot. The
+pool used to be sized at 0.8 of memory (1.05-1.10M tokens, 4 full windows, drifting by about 0.7 GiB between
+boots) with a cap of 8. An empty `KV_CACHE_MEMORY_BYTES=` brings that sizing back, and `MAX_NUM_SEQS=8` the old
+cap. Checks on the 27 GB pool, still with the cap of 8:
 
 - Five prompts of 246,388-253,222 tokens, each generating 3,000 tokens, decoded together with no preemption.
   vLLM reads one prompt at a time, so the fifth got its first token after 652 s. Lowest `MemAvailable` 12.4 GiB.
@@ -198,8 +200,20 @@ The default pool is pinned at 27 GB, so five full 262,144-token requests decode 
   92.2). sixcat sends 4 requests at once, so long answers differ between any two runs; one config swings as
   much as the two differ (tools by 10 points, instruct by 5).
 
-`kv-max` changes only the pool size, so it answers exactly like the default. Leave nothing else big running on
-the Spark with it, or lower `KV_CACHE_MEMORY_BYTES`.
+Checks on the cap of 5, same pool:
+
+- Up to 5 requests nothing changes. With 8 or 16 the extra requests wait for a slot, so total output drops:
+  51 t/s against 63 with 8k prompts (-19%), 23 against 25 with 32k prompts (-8%), and the slowest of 16 8k
+  requests got its first token after 145 s against 98 s. That is the price of room for a full window each.
+- The first start after a cap change rebuilds part of b12x's kernel cache, about 5 extra minutes. The rebuilt
+  kernels move perplexity at the fourth decimal, in both directions: all text 1.0892 (cap 8: 1.0902), fresh
+  text 2.2061 (2.2049). Lowest `MemAvailable` 11.4 GiB again.
+
+`kv-max` changes only the pool size and the cap. It costs no quality: its perplexity stays within 0.1% of the
+default (fresh text 2.2039 against 2.2061, all text 1.0897 against 1.0892), measured with the cap at 5 to reuse
+the kernels; the cap of 6 has not been booted yet. It costs memory: `MemAvailable` went down to 4.4 GiB during a
+96k-token prompt, close to its 4 GiB floor. Leave nothing else big running on the Spark with it, or lower
+`KV_CACHE_MEMORY_BYTES`.
 
 `1m` stretches the checkpoint's 262,144 positions 4x with YaRN, which changes every answer, short ones included.
 A needle hidden in 524,288 and in 1,040,000 tokens of text was found 5 times out of 5 at each length.
@@ -292,7 +306,7 @@ built locally from its repository.
 | Time to first token, 128k prose | 65.5 s | 86.0 s | **60.2 s** | 63.9 s |
 | KV cache | 1,365,333 tokens | 1,365,333 tokens | 876,726 tokens | **≈1.57M tokens** (26.45 GiB) |
 | Full 262k requests at once | **5** | **5** | 3 | **5** (its cap) |
-| Requests decoded at once (cap) | 8 | 8 | **16** | 5 |
+| Requests decoded at once (cap) | 5 | 5 | **16** | 5 |
 
 What the numbers say:
 
@@ -303,9 +317,10 @@ What the numbers say:
   geometric means) and prefills 13% faster, with MTP up to 7 and Marlin kernels. TensorFold is second (51.6 t/s,
   1,858 t/s) and the fastest of all on short code (67.9 t/s at 0.5k). All four stay above 38 t/s at 128k.
 - **No recipe serves the most requests at every length.** This recipe holds 1,365,333 tokens of FP8 KV in its
-  27 GB default pool with a cap of 8: 8 requests up to about 170k each, 5 at the full 262k window. hibrid48 keeps BF16 KV, 877k tokens, with a cap of 16: the most short requests, 3 full
-  windows. TensorFold takes all memory but 10 GiB, about 1.57M tokens, with a cap of 5: all 5 at full windows.
-  `PROFILE=kv-max` gives this recipe the largest pool, 1.72M tokens, 6 full windows.
+  27 GB default pool with a cap of 5: 5 requests at any length up to the full 262k window. hibrid48 keeps BF16
+  KV, 877k tokens, with a cap of 16: the most requests up to 128k, 3 full windows. TensorFold takes all memory
+  but 10 GiB, about 1.57M tokens, with a cap of 5: all 5 at full windows. `PROFILE=kv-max` gives this recipe
+  the largest pool, 1.72M tokens, and a cap of 6: 6 full windows.
 - **`quality` is the most precise, not the most useful.** It tracks a full-precision run twice as closely and
   has the lowest perplexity on book prose and code, but scores within noise of `fast` on both task benchmarks
   and prefills 21% slower.
@@ -468,8 +483,9 @@ a second quant of the FP4-Local checkpoint.
 - **Port 8000 already in use.** `PORT=9000 ./start.sh`, or `./start.sh restart` if it is this recipe's container.
 - **Out of memory while loading.** Lower `KV_CACHE_MEMORY_BYTES` (for example `22000000000`, about 4 full
   windows) or `MAX_MODEL_LEN` (`131072`).
-- **Slow first start.** The first load compiles kernels and reads about 96 GiB; later starts are faster. Follow it
-  with `docker logs -f qwen38-flash-next-fp4`.
+- **Slow first start.** The first load compiles kernels and reads about 96 GiB; later starts are faster.
+  Changing `MAX_NUM_SEQS` rebuilds part of the kernel cache on the next start, about 5 minutes. Follow it with
+  `docker logs -f qwen38-flash-next-fp4`.
 - **Unknown quantization or load format.** You are not on `eugr/spark-vllm-b12x`; upstream vLLM cannot read this
   checkpoint's NVFP4 scales yet. Keep the default `IMAGE`.
 
