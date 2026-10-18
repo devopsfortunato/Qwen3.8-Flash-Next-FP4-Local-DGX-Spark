@@ -3,10 +3,13 @@
 # A value comes from the first of these that sets it:
 #   1. the environment: PORT=9000 ./start.sh
 #   2. ./.env next to start.sh (KEY=value lines, read, never executed)
-#   3. the default below
+#   3. profiles/${PROFILE}.env when PROFILE is set (same format): PROFILE=1m ./start.sh
+#   4. the default below
 # start.sh and scripts/prepare.sh cd to the repository root before sourcing this file.
 
-if [[ -f .env ]]; then
+# Export KEY=value lines from file $1 for keys that are not set yet.
+load_env_file() {
+  local _line _key _value
   while IFS= read -r _line || [[ -n "${_line}" ]]; do
     [[ "${_line}" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
     _key="${BASH_REMATCH[2]}"
@@ -18,9 +21,20 @@ if [[ -f .env ]]; then
       _value="${_value%"${_value##*[![:space:]]}"}"
     fi
     [[ -n "${!_key+x}" ]] || export "${_key}=${_value}"
-  done < .env
+  done < "$1"
+}
+
+if [[ -f .env ]]; then
+  load_env_file .env
 fi
-unset _line _key _value
+# Opt-in launch profiles (README, Profiles). Empty is the default recipe.
+PROFILE="${PROFILE:-}"
+PROFILE_DIR="${PROFILE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/profiles}"
+PROFILE_FILE=""
+if [[ -n "${PROFILE}" && "${PROFILE}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && -f "${PROFILE_DIR}/${PROFILE}.env" ]]; then
+  PROFILE_FILE="${PROFILE_DIR}/${PROFILE}.env"
+  load_env_file "${PROFILE_FILE}"
+fi
 
 # Checkpoint and container. Flags match the NVIDIA model card's DGX Spark command.
 MODEL_ID="${MODEL_ID:-nvidia/Qwen3.8-Flash-Next-FP4-Local}"
@@ -39,11 +53,22 @@ QUANTIZATION="${QUANTIZATION:-modelopt_mixed}"
 LOAD_FORMAT="${LOAD_FORMAT:-b12x}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+# Requests decoded at once. 5 matches the default KV pool, which holds five full 262,144-token requests, so
+# every running request has room to reach the full window. Requests past the cap wait for a free slot.
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-5}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
-# 0 omits --speculative-config. The model card uses MTP with 4 draft tokens.
-MTP_TOKENS="${MTP_TOKENS:-4}"
+# Bytes for the KV cache (--kv-cache-memory-bytes). 27 GB holds about 1.36M FP8 tokens: five full
+# 262,144-token requests at once, with 11.4 GiB or more of memory left free while serving. Set it empty
+# (KV_CACHE_MEMORY_BYTES=) for the GPU_MEMORY_UTILIZATION sizing, which drifts by about 0.7 GiB between boots.
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES-27000000000}"
+# YaRN rope scaling for windows past the checkpoint's 262,144 positions (NATIVE_MAX_LEN).
+# Empty or 1 leaves rope alone. 4 allows MAX_MODEL_LEN up to 1,048,576.
+YARN_FACTOR="${YARN_FACTOR:-}"
+NATIVE_MAX_LEN="${NATIVE_MAX_LEN:-262144}"
+# 0 omits --speculative-config. The model card uses 4 draft tokens. 3 decodes as fast on a Spark
+# and leaves 4-9% more KV cache (README, Benchmarks).
+MTP_TOKENS="${MTP_TOKENS:-3}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
 GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL:-b12x}"
 LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
@@ -71,6 +96,18 @@ export VLLM_MXFP8_LM_HEAD="${VLLM_MXFP8_LM_HEAD:-1}"
 export VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE="${VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE:-w13}"
 export VLLM_B12X_MOE_FP4_FORCE_A16="${VLLM_B12X_MOE_FP4_FORCE_A16:-1}"
 export B12X_W4A16_A4_PREFILL="${B12X_W4A16_A4_PREFILL:-1}"
+# Activation precision (README, Precision). fast (the default): the model card's settings, one FP4 term for
+# prefill MoE activations and the dense format the autotuner picks for speed. quality: an FP4 residual term on
+# top, and BF16 activations in the dense NVFP4/MXFP8 layers; closer to full precision token by token, about 21%
+# less prefill speed. Setting either variable below directly wins.
+PRECISION="${PRECISION:-fast}"
+if [[ "${PRECISION}" == quality ]]; then
+  export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-2}"
+  export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-a16}"
+else
+  export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-1}"
+  export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-auto}"
+fi
 # The serve container stays offline once the snapshot is on disk. prepare.sh turns this off for the download.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
@@ -90,8 +127,13 @@ SPARK_ENV=(
   VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE
   VLLM_B12X_MOE_FP4_FORCE_A16
   B12X_W4A16_A4_PREFILL
+  B12X_W4A16_A4_PREFILL_TERMS
+  VLLM_B12X_DENSE_ACTIVATION_MODE
   HF_HUB_OFFLINE
 )
+
+# More container environment, as space-separated NAME=value pairs: EXTRA_ENV="B12X_FOO=1 B12X_BAR=2".
+EXTRA_ENV="${EXTRA_ENV:-}"
 
 HF_CACHE="${HF_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}}"
 VLLM_CACHE="${VLLM_CACHE:-${HOME}/.cache/vllm}"
@@ -107,8 +149,12 @@ MIN_FREE_GB="${MIN_FREE_GB:-120}"
 IMAGE_FREE_GB="${IMAGE_FREE_GB:-30}"
 # MemAvailable required before docker run. Override, or set MEM_CHECK=0 to warn instead of exit.
 MEM_NEED_GIB="${MEM_NEED_GIB:-90}"
-# While weights load, start.sh stops the container if MemAvailable falls below this.
+# While weights load, start.sh stops the container if MemAvailable stays below MEM_FLOOR_GIB for
+# MEM_FLOOR_GRACE seconds, or falls below MEM_HARD_FLOOR_GIB at all. The grace covers the dip of a few
+# seconds to about 4 GiB that every load goes through while vLLM repacks the loaded weights.
 MEM_FLOOR_GIB="${MEM_FLOOR_GIB:-8}"
+MEM_FLOOR_GRACE="${MEM_FLOOR_GRACE:-30}"
+MEM_HARD_FLOOR_GIB="${MEM_HARD_FLOOR_GIB:-2}"
 MEM_CHECK="${MEM_CHECK:-1}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-1800}"
 STOP_TIMEOUT="${STOP_TIMEOUT:-30}"
@@ -198,8 +244,34 @@ validate_config() {
   if ! is_uint "${BLOCK_SIZE}" || (( BLOCK_SIZE < 1 )); then
     die "BLOCK_SIZE is a positive integer, not ${BLOCK_SIZE}"
   fi
-  if ! is_uint "${MAX_MODEL_LEN}" || (( MAX_MODEL_LEN < 1 || MAX_MODEL_LEN > 1048576 )); then
-    die "MAX_MODEL_LEN is 1 to 1048576, not ${MAX_MODEL_LEN}"
+  if [[ -n "${PROFILE}" && -z "${PROFILE_FILE}" ]]; then
+    local names="" f
+    for f in "${PROFILE_DIR}"/*.env; do
+      [[ -f "${f}" ]] && names+=" $(basename "${f}" .env)"
+    done
+    die "PROFILE ${PROFILE} has no file ${PROFILE_DIR}/${PROFILE}.env (profiles:${names:- none})"
+  fi
+  if [[ -n "${KV_CACHE_MEMORY_BYTES}" ]] && { ! is_uint "${KV_CACHE_MEMORY_BYTES}" || (( KV_CACHE_MEMORY_BYTES < 1073741824 )); }; then
+    die "KV_CACHE_MEMORY_BYTES is a byte count of at least 1 GiB, not ${KV_CACHE_MEMORY_BYTES}"
+  fi
+  if [[ -n "${YARN_FACTOR}" ]] && { ! is_uint "${YARN_FACTOR}" || (( YARN_FACTOR < 1 || YARN_FACTOR > 16 )); }; then
+    die "YARN_FACTOR is 1 to 16, not ${YARN_FACTOR}"
+  fi
+  if [[ ! "${PRECISION}" =~ ^(quality|fast)$ ]]; then
+    die "PRECISION is quality or fast, not ${PRECISION}"
+  fi
+  if [[ ! "${B12X_W4A16_A4_PREFILL_TERMS}" =~ ^[12]$ ]]; then
+    die "B12X_W4A16_A4_PREFILL_TERMS is 1 or 2, not ${B12X_W4A16_A4_PREFILL_TERMS}"
+  fi
+  if [[ ! "${VLLM_B12X_DENSE_ACTIVATION_MODE}" =~ ^(auto|a16|quantized)$ ]]; then
+    die "VLLM_B12X_DENSE_ACTIVATION_MODE is auto, a16, or quantized, not ${VLLM_B12X_DENSE_ACTIVATION_MODE}"
+  fi
+  if ! is_uint "${NATIVE_MAX_LEN}" || (( NATIVE_MAX_LEN < 1 )); then
+    die "NATIVE_MAX_LEN is a positive integer, not ${NATIVE_MAX_LEN}"
+  fi
+  local max_len=$(( NATIVE_MAX_LEN * ${YARN_FACTOR:-1} ))
+  if ! is_uint "${MAX_MODEL_LEN}" || (( MAX_MODEL_LEN < 1 || MAX_MODEL_LEN > max_len )); then
+    die "MAX_MODEL_LEN is 1 to ${max_len} with YARN_FACTOR ${YARN_FACTOR:-unset}, not ${MAX_MODEL_LEN} (PROFILE=1m sets both)"
   fi
   if ! is_uint "${MAX_NUM_SEQS}" || (( MAX_NUM_SEQS < 1 || MAX_NUM_SEQS > 256 )); then
     die "MAX_NUM_SEQS is 1 to 256, not ${MAX_NUM_SEQS}"
@@ -231,6 +303,18 @@ validate_config() {
   if ! is_uint "${MEM_FLOOR_GIB}"; then
     die "MEM_FLOOR_GIB is a GiB count, not ${MEM_FLOOR_GIB}"
   fi
+  local pair
+  local -a pairs=()
+  read -r -a pairs <<< "${EXTRA_ENV}"
+  for pair in "${pairs[@]}"; do
+    [[ "${pair}" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*$ ]] || die "EXTRA_ENV holds NAME=value pairs, not ${pair}"
+  done
+  if ! is_uint "${MEM_FLOOR_GRACE}"; then
+    die "MEM_FLOOR_GRACE is seconds, not ${MEM_FLOOR_GRACE}"
+  fi
+  if ! is_uint "${MEM_HARD_FLOOR_GIB}" || (( MEM_HARD_FLOOR_GIB > MEM_FLOOR_GIB )); then
+    die "MEM_HARD_FLOOR_GIB is a GiB count no higher than MEM_FLOOR_GIB, not ${MEM_HARD_FLOOR_GIB}"
+  fi
   if ! is_uint "${MIN_FREE_GB}"; then
     die "MIN_FREE_GB is a GB count, not ${MIN_FREE_GB}"
   fi
@@ -240,6 +324,14 @@ validate_config() {
   if ! is_uint "${WAIT_TIMEOUT}" || (( WAIT_TIMEOUT < 1 )); then
     die "WAIT_TIMEOUT is seconds, not ${WAIT_TIMEOUT}"
   fi
+}
+
+# --hf-overrides for YaRN. vLLM replaces rope_parameters as a whole, so every key of the checkpoint's
+# text_config.rope_parameters is restated. vLLM also checks --max-model-len against
+# max_position_embeddings, not against the YaRN factor, so that is raised to match.
+yarn_overrides() {
+  printf '{"text_config":{"max_position_embeddings":%d,"rope_parameters":{"rope_type":"yarn","factor":%d,"original_max_position_embeddings":%d,"rope_theta":10000000,"partial_rotary_factor":0.25,"mrope_section":[11,11,10],"mrope_interleaved":true}}}' \
+    "$(( NATIVE_MAX_LEN * YARN_FACTOR ))" "${YARN_FACTOR}" "${NATIVE_MAX_LEN}"
 }
 
 # Fill the global DOCKER_CMD array. Extra arguments are appended and override earlier flags
@@ -261,6 +353,11 @@ build_docker_cmd() {
   )
   for key in "${SPARK_ENV[@]}"; do
     DOCKER_CMD+=(-e "${key}=${!key}")
+  done
+  local -a extra=()
+  read -r -a extra <<< "${EXTRA_ENV}"
+  for key in "${extra[@]}"; do
+    DOCKER_CMD+=(-e "${key}")
   done
   if [[ -n "${HF_TOKEN:-}" ]]; then
     DOCKER_CMD+=(-e HF_TOKEN)
@@ -307,6 +404,12 @@ build_docker_cmd() {
     --compilation-config "${COMPILATION_CONFIG}"
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   )
+  if [[ -n "${KV_CACHE_MEMORY_BYTES}" ]]; then
+    DOCKER_CMD+=(--kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}")
+  fi
+  if (( ${YARN_FACTOR:-1} > 1 )); then
+    DOCKER_CMD+=(--hf-overrides "$(yarn_overrides)")
+  fi
   if (( ${#cmd[@]} > 0 )); then
     DOCKER_CMD+=("${cmd[@]}")
   fi

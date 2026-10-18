@@ -22,10 +22,12 @@ unset_recipe() {
     VLLM_WORKER_MULTIPROC_METHOD VLLM_SSM_CONV_STATE_LAYOUT VLLM_USE_AOT_COMPILE \
     VLLM_USE_MEGA_AOT_ARTIFACT VLLM_USE_V2_MODEL_RUNNER B12X_POLICY_MODE \
     VLLM_MXFP8_LM_HEAD VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE VLLM_B12X_MOE_FP4_FORCE_A16 \
-    B12X_W4A16_A4_PREFILL HF_HUB_OFFLINE HF_TOKEN HF_HOME HF_CACHE VLLM_CACHE \
+    B12X_W4A16_A4_PREFILL PRECISION B12X_W4A16_A4_PREFILL_TERMS VLLM_B12X_DENSE_ACTIVATION_MODE \
+    HF_HUB_OFFLINE HF_TOKEN HF_HOME HF_CACHE VLLM_CACHE \
     FLASHINFER_CACHE TRITON_CACHE B12X_CACHE STATE_DIR LOG_DIR MIN_FREE_GB IMAGE_FREE_GB \
-    MEM_NEED_GIB MEM_FLOOR_GIB MEM_CHECK WAIT_TIMEOUT STOP_TIMEOUT STOP_LOCK_WAIT PREPARE PULL \
-    DRY_RUN FOREGROUND || true
+    MEM_NEED_GIB MEM_FLOOR_GIB MEM_FLOOR_GRACE MEM_HARD_FLOOR_GIB MEM_CHECK WAIT_TIMEOUT STOP_TIMEOUT \
+    STOP_LOCK_WAIT PREPARE PULL DRY_RUN FOREGROUND PROFILE PROFILE_DIR PROFILE_FILE \
+    KV_CACHE_MEMORY_BYTES YARN_FACTOR NATIVE_MAX_LEN EXTRA_ENV || true
 }
 
 has_pair() {
@@ -55,15 +57,19 @@ check_defaults() {
   [[ "${QUANTIZATION}" == "modelopt_mixed" ]] || return 1
   [[ "${LOAD_FORMAT}" == "b12x" ]] || return 1
   [[ "${KV_CACHE_DTYPE}" == "fp8" ]] || return 1
-  [[ "${MTP_TOKENS}" == "4" ]] || return 1
+  [[ "${MTP_TOKENS}" == "3" ]] || return 1
+  [[ -z "${PROFILE}" && "${KV_CACHE_MEMORY_BYTES}" == "27000000000" && -z "${YARN_FACTOR}" ]] || return 1
   [[ "${MAX_MODEL_LEN}" == "262144" ]] || return 1
-  [[ "${MAX_NUM_SEQS}" == "8" ]] || return 1
+  [[ "${MAX_NUM_SEQS}" == "5" ]] || return 1
   [[ "${GPU_MEMORY_UTILIZATION}" == "0.8" ]] || return 1
   [[ "${VLLM_PLE_TABLE_MEMORY}" == "disk" ]] || return 1
   [[ "${B12X_DISK_BACKEND}" == "io_uring" ]] || return 1
   [[ "${CUTE_DSL_ARCH}" == "sm_121a" ]] || return 1
   [[ "${VLLM_B12X_MOE_FP4_FORCE_A16}" == "1" ]] || return 1
   [[ "${B12X_W4A16_A4_PREFILL}" == "1" ]] || return 1
+  [[ "${PRECISION}" == "fast" ]] || return 1
+  [[ "${B12X_W4A16_A4_PREFILL_TERMS}" == "1" ]] || return 1
+  [[ "${VLLM_B12X_DENSE_ACTIVATION_MODE}" == "auto" ]] || return 1
 }
 
 check_cmd() {
@@ -83,7 +89,7 @@ check_cmd() {
   has_pair --dtype bfloat16 || return 1
   has_pair --block-size 16 || return 1
   has_pair --max-model-len 262144 || return 1
-  has_pair --max-num-seqs 8 || return 1
+  has_pair --max-num-seqs 5 || return 1
   has_pair --max-num-batched-tokens 4096 || return 1
   has_pair --gdn-decode-kernel b12x || return 1
   has_pair --linear-backend b12x || return 1
@@ -111,8 +117,12 @@ check_cmd() {
   has_word "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13" || return 1
   has_word "VLLM_B12X_MOE_FP4_FORCE_A16=1" || return 1
   has_word "B12X_W4A16_A4_PREFILL=1" || return 1
+  has_word "B12X_W4A16_A4_PREFILL_TERMS=1" || return 1
+  has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=auto" || return 1
   has_word "--speculative-config" || return 1
-  has_word '{"method":"mtp","num_speculative_tokens":4}' || return 1
+  has_word '{"method":"mtp","num_speculative_tokens":3}' || return 1
+  has_pair --kv-cache-memory-bytes 27000000000 || return 1
+  has_word --hf-overrides && return 1
   has_word '{"pass_config":{"fuse_act_quant":true}}' || return 1
   has_word "eugr/spark-vllm-b12x:latest" || return 1
   printf '%s\n' "${DOCKER_CMD[@]}" | grep -q 'secret-token' && return 1
@@ -175,13 +185,33 @@ pass "environment wins over .env"
 
 (
   unset_recipe
+  KV_CACHE_MEMORY_BYTES=
+  export KV_CACHE_MEMORY_BYTES
+  cd "${tmp}"
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  validate_config
+  build_docker_cmd
+  if has_word --kv-cache-memory-bytes; then
+    exit 1
+  fi
+  has_pair --gpu-memory-utilization 0.8
+)
+pass "an empty KV_CACHE_MEMORY_BYTES keeps the utilization sizing"
+
+(
+  unset_recipe
   PORT=9001 MTP_TOKENS=0 VLLM_PLE_TABLE_MEMORY=gpu KV_CACHE_DTYPE=bfloat16 HF_TOKEN=secret-token
   export PORT MTP_TOKENS VLLM_PLE_TABLE_MEMORY KV_CACHE_DTYPE HF_TOKEN
   cd "${tmp}"
   # shellcheck source=scripts/config.sh
   source "${CONFIG}"
   validate_config
+  EXTRA_ENV="B12X_TEST_A=1 B12X_TEST_B=two"
+  validate_config
   build_docker_cmd --max-num-seqs 2
+  has_pair -e B12X_TEST_A=1
+  has_pair -e B12X_TEST_B=two
   has_pair --port 9001
   has_word "VLLM_PLE_TABLE_MEMORY=gpu"
   has_pair --kv-cache-dtype bfloat16
@@ -196,6 +226,92 @@ pass "environment wins over .env"
 )
 pass "environment overrides reach the docker command and the token stays off the command line"
 
+(
+  unset_recipe
+  PRECISION=quality
+  export PRECISION
+  cd "${tmp}"
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  validate_config
+  build_docker_cmd
+  has_word "B12X_W4A16_A4_PREFILL_TERMS=2"
+  has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=a16"
+)
+(
+  unset_recipe
+  PRECISION=quality VLLM_B12X_DENSE_ACTIVATION_MODE=auto
+  export PRECISION VLLM_B12X_DENSE_ACTIVATION_MODE
+  cd "${tmp}"
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  [[ "${B12X_W4A16_A4_PREFILL_TERMS}" == "2" ]]
+  [[ "${VLLM_B12X_DENSE_ACTIVATION_MODE}" == "auto" ]]
+)
+pass "PRECISION=quality sets the two-term prefill and BF16 dense activations, and a variable set directly wins"
+
+prof_dir="${tmp}/profiles"
+mkdir -p "${prof_dir}"
+printf 'KV_CACHE_MEMORY_BYTES=30000000000\nYARN_FACTOR=4\nMAX_MODEL_LEN=1048576\nPORT=7000\n' > "${prof_dir}/test.env"
+(
+  unset_recipe
+  PROFILE=test PROFILE_DIR="${prof_dir}"
+  export PROFILE PROFILE_DIR
+  cd "${tmp}"
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  validate_config
+  build_docker_cmd
+  has_pair --kv-cache-memory-bytes 30000000000
+  has_pair --max-model-len 1048576
+  has_pair --port 7000
+  json=""
+  for (( i = 0; i < ${#DOCKER_CMD[@]} - 1; i++ )); do
+    [[ "${DOCKER_CMD[i]}" == --hf-overrides ]] && json="${DOCKER_CMD[i + 1]}"
+  done
+  python3 -c 'import json, sys
+t = json.loads(sys.argv[1])["text_config"]
+r = t["rope_parameters"]
+assert t["max_position_embeddings"] == 1048576
+assert r["rope_type"] == "yarn" and r["factor"] == 4 and r["original_max_position_embeddings"] == 262144
+assert r["mrope_section"] == [11, 11, 10] and r["mrope_interleaved"] is True' "${json}"
+)
+pass "a profile sets the KV pool and YaRN, and the overrides are valid JSON"
+
+prof_env="${tmp}/prof-env"
+mkdir -p "${prof_env}"
+printf 'MAX_MODEL_LEN=524288\n' > "${prof_env}/.env"
+(
+  unset_recipe
+  PROFILE=test PROFILE_DIR="${prof_dir}" PORT=7100
+  export PROFILE PROFILE_DIR PORT
+  cd "${prof_env}"
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  [[ "${PORT}" == "7100" ]]
+  [[ "${MAX_MODEL_LEN}" == "524288" ]]
+  [[ "${YARN_FACTOR}" == "4" ]]
+)
+pass "environment and .env win over the profile"
+
+for prof in "${ROOT}"/profiles/*.env; do
+  [[ -f "${prof}" ]] || continue
+  name="$(basename "${prof}" .env)"
+  (
+    unset_recipe
+    PROFILE="${name}"
+    export PROFILE
+    cd "${tmp}"
+    # shellcheck source=scripts/config.sh
+    source "${CONFIG}"
+    validate_config
+    build_docker_cmd
+    has_pair --max-model-len "${MAX_MODEL_LEN}"
+    has_pair --max-num-seqs "${MAX_NUM_SEQS}"
+  ) >/dev/null || fail "profile ${name} does not validate"
+  pass "profile ${name} validates and builds"
+done
+
 for bad in \
   'PORT=0' \
   'PORT=70000' \
@@ -203,6 +319,15 @@ for bad in \
   'GPU_MEMORY_UTILIZATION=1.5' \
   'MTP_TOKENS=99' \
   'MAX_MODEL_LEN=0' \
+  'MAX_MODEL_LEN=1048576' \
+  'YARN_FACTOR=0' \
+  'KV_CACHE_MEMORY_BYTES=30G' \
+  'PRECISION=max' \
+  'B12X_W4A16_A4_PREFILL_TERMS=3' \
+  'VLLM_B12X_DENSE_ACTIVATION_MODE=bf16' \
+  'MEM_HARD_FLOOR_GIB=9' \
+  'PROFILE=no-such-profile' \
+  'EXTRA_ENV=not-a-pair' \
   'PREPARE=maybe' \
   'MODEL_ID=not-a-repo'
 do

@@ -10,6 +10,7 @@
 #   ./start.sh stop             # same as ./stop.sh
 #   DRY_RUN=1 ./start.sh        # print the docker command and change nothing
 #   PORT=9000 ./start.sh        # environment wins over .env
+#   PROFILE=1m ./start.sh       # opt-in profile from profiles/ (kv-max, 1m); .env can set PROFILE too
 # Extra arguments are appended to `vllm serve` after the defaults.
 # Settings live in scripts/config.sh (environment, then ./.env, then the defaults).
 set -euo pipefail
@@ -40,9 +41,21 @@ flock -n 8 || die "another ./start.sh or ./stop.sh is running; wait for it to fi
 B=$'\033[1m'; M=$'\033[1;35m'; G=$'\033[1;32m'; D=$'\033[2m'; R=$'\033[0m'
 [[ -t 1 ]] || { B=; M=; G=; D=; R=; }
 printf '\n%sQwen3.8 Flash Next FP4 Local%s\n' "${M}" "${R}"
-printf '%s %s · %s seqs · %s-token window · %s KV · MTP %s · PLE %s · port %s%s\n\n' \
+printf '%s %s · %s seqs · %s-token window · %s KV · MTP %s · PLE %s · port %s%s\n' \
   "${D}" "${MODEL_ID}" "${MAX_NUM_SEQS}" "${MAX_MODEL_LEN}" "${KV_CACHE_DTYPE}" \
   "${MTP_TOKENS}" "${VLLM_PLE_TABLE_MEMORY}" "${PORT}" "${R}"
+PROFILE_LINE="default"
+if [[ -n "${PROFILE}" ]]; then
+  PROFILE_LINE="${PROFILE} (profiles/${PROFILE}.env)"
+fi
+KV_LINE="GPU_MEMORY_UTILIZATION ${GPU_MEMORY_UTILIZATION}"
+if [[ -n "${KV_CACHE_MEMORY_BYTES}" ]]; then
+  KV_LINE="${KV_CACHE_MEMORY_BYTES} bytes (KV_CACHE_MEMORY_BYTES)"
+fi
+if (( ${YARN_FACTOR:-1} > 1 )); then
+  KV_LINE="${KV_LINE} · YaRN ${YARN_FACTOR}x"
+fi
+printf '%s profile %s · KV pool %s%s\n\n' "${D}" "${PROFILE_LINE}" "${KV_LINE}" "${R}"
 
 api_base() {
   local host="${HOST}"
@@ -161,6 +174,7 @@ fail() {
 start_s="${SECONDS}"
 next_beat=15
 served=""
+low_since=""
 while (( SECONDS - start_s < WAIT_TIMEOUT )); do
   if curl -sf --max-time 5 "${URL}/v1/models" -o "${STATE_DIR}/models.json"; then
     if served="$(python3 -c 'import json,sys
@@ -177,9 +191,17 @@ print(ids[0])' "${STATE_DIR}/models.json" 2>/dev/null)"; then
     fail "the server exited (code ${code}) before /v1/models answered"
   fi
   if floor="$(mem_available_gib)"; then
-    if (( floor < MEM_FLOOR_GIB )); then
+    if (( floor < MEM_HARD_FLOOR_GIB )); then
       docker stop -t 5 "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-      fail "only ${floor} GiB memory left while loading (MEM_FLOOR_GIB ${MEM_FLOOR_GIB}): stopped"
+      fail "only ${floor} GiB memory left while loading (MEM_HARD_FLOOR_GIB ${MEM_HARD_FLOOR_GIB}): stopped"
+    elif (( floor < MEM_FLOOR_GIB )); then
+      low_since="${low_since:-${SECONDS}}"
+      if (( SECONDS - low_since >= MEM_FLOOR_GRACE )); then
+        docker stop -t 5 "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+        fail "under ${MEM_FLOOR_GIB} GiB memory for ${MEM_FLOOR_GRACE}s while loading (${floor} GiB now, MEM_FLOOR_GIB): stopped"
+      fi
+    else
+      low_since=""
     fi
   fi
   if (( SECONDS - start_s >= next_beat )); then
@@ -194,6 +216,7 @@ if [[ -z "${served}" ]]; then
 fi
 LOADED_S=$((SECONDS - start_s))
 log "Server answered /v1/models after ${LOADED_S}s (${served})"
+KV_TOKENS="$(docker logs "${CONTAINER_NAME}" 2>&1 | grep -oE 'GPU KV cache size: [0-9,]+ tokens' | tail -n 1 | grep -oE '[0-9,]+' || true)"
 
 step 5 "Smoke test: one chat completion"
 body="$(SERVED="${served}" python3 -c 'import json,os
@@ -235,6 +258,8 @@ cat <<EOF
   Checkpoint   ${MODEL_ID}
   Image        ${IMAGE}
   Window       ${MAX_MODEL_LEN} tokens · ${MAX_NUM_SEQS} at once · ${KV_CACHE_DTYPE} KV · MTP ${MTP_TOKENS}
+  Profile      ${PROFILE_LINE}
+  KV cache     ${KV_TOKENS:-see docker logs} tokens · pool ${KV_LINE}
   PLE table    ${VLLM_PLE_TABLE_MEMORY} (${B12X_DISK_BACKEND})
   Loaded in    ${LOADED_S}s
   Logs         docker logs -f ${CONTAINER_NAME}
