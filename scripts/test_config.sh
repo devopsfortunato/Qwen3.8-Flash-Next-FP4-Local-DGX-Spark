@@ -58,7 +58,7 @@ check_defaults() {
   [[ "${LOAD_FORMAT}" == "b12x" ]] || return 1
   [[ "${KV_CACHE_DTYPE}" == "fp8" ]] || return 1
   [[ "${MTP_TOKENS}" == "3" ]] || return 1
-  [[ -z "${PROFILE}" && -z "${KV_CACHE_MEMORY_BYTES}" && -z "${YARN_FACTOR}" ]] || return 1
+  [[ -z "${PROFILE}" && "${KV_CACHE_MEMORY_BYTES}" == "27000000000" && -z "${YARN_FACTOR}" ]] || return 1
   [[ "${MAX_MODEL_LEN}" == "262144" ]] || return 1
   [[ "${MAX_NUM_SEQS}" == "8" ]] || return 1
   [[ "${GPU_MEMORY_UTILIZATION}" == "0.8" ]] || return 1
@@ -121,7 +121,7 @@ check_cmd() {
   has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=auto" || return 1
   has_word "--speculative-config" || return 1
   has_word '{"method":"mtp","num_speculative_tokens":3}' || return 1
-  has_word --kv-cache-memory-bytes && return 1
+  has_pair --kv-cache-memory-bytes 27000000000 || return 1
   has_word --hf-overrides && return 1
   has_word '{"pass_config":{"fuse_act_quant":true}}' || return 1
   has_word "eugr/spark-vllm-b12x:latest" || return 1
@@ -182,6 +182,22 @@ printf 'PORT=9000\nIMAGE=from-dotenv:latest\n' > "${win_dir}/.env"
   [[ "${IMAGE}" == "from-dotenv:latest" ]]
 )
 pass "environment wins over .env"
+
+(
+  unset_recipe
+  KV_CACHE_MEMORY_BYTES=
+  export KV_CACHE_MEMORY_BYTES
+  cd "${tmp}"
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  validate_config
+  build_docker_cmd
+  if has_word --kv-cache-memory-bytes; then
+    exit 1
+  fi
+  has_pair --gpu-memory-utilization 0.8
+)
+pass "an empty KV_CACHE_MEMORY_BYTES keeps the utilization sizing"
 
 (
   unset_recipe

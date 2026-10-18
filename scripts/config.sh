@@ -56,9 +56,10 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
-# Bytes for the KV cache (--kv-cache-memory-bytes). Set, it replaces the GPU_MEMORY_UTILIZATION sizing,
-# which drifts by about 0.7 GiB between boots on unified memory. Empty keeps the utilization sizing.
-KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-}"
+# Bytes for the KV cache (--kv-cache-memory-bytes). 27 GB holds about 1.36M FP8 tokens: five full
+# 262,144-token requests at once, with 11.4 GiB or more of memory left free while serving. Set it empty
+# (KV_CACHE_MEMORY_BYTES=) for the GPU_MEMORY_UTILIZATION sizing, which drifts by about 0.7 GiB between boots.
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES-27000000000}"
 # YaRN rope scaling for windows past the checkpoint's 262,144 positions (NATIVE_MAX_LEN).
 # Empty or 1 leaves rope alone. 4 allows MAX_MODEL_LEN up to 1,048,576.
 YARN_FACTOR="${YARN_FACTOR:-}"
