@@ -27,7 +27,7 @@ unset_recipe() {
     FLASHINFER_CACHE TRITON_CACHE B12X_CACHE STATE_DIR LOG_DIR MIN_FREE_GB IMAGE_FREE_GB \
     MEM_NEED_GIB MEM_FLOOR_GIB MEM_FLOOR_GRACE MEM_HARD_FLOOR_GIB MEM_CHECK WAIT_TIMEOUT STOP_TIMEOUT \
     STOP_LOCK_WAIT PREPARE PULL DRY_RUN FOREGROUND PROFILE PROFILE_DIR PROFILE_FILE \
-    KV_CACHE_MEMORY_BYTES YARN_FACTOR NATIVE_MAX_LEN EXTRA_ENV || true
+    KV_CACHE_MEMORY_BYTES YARN_FACTOR NATIVE_MAX_LEN EXTRA_ENV PLE_QUEUE_DEPTH || true
 }
 
 has_pair() {
@@ -58,9 +58,10 @@ check_defaults() {
   [[ "${LOAD_FORMAT}" == "b12x" ]] || return 1
   [[ "${KV_CACHE_DTYPE}" == "fp8" ]] || return 1
   [[ "${MTP_TOKENS}" == "3" ]] || return 1
-  [[ -z "${PROFILE}" && "${KV_CACHE_MEMORY_BYTES}" == "27000000000" && -z "${YARN_FACTOR}" ]] || return 1
+  [[ -z "${PROFILE}" && "${KV_CACHE_MEMORY_BYTES}" == "31150000000" && -z "${YARN_FACTOR}" ]] || return 1
   [[ "${MAX_MODEL_LEN}" == "262144" ]] || return 1
-  [[ "${MAX_NUM_SEQS}" == "5" ]] || return 1
+  [[ "${MAX_NUM_SEQS}" == "8" ]] || return 1
+  [[ "${PLE_QUEUE_DEPTH}" == "256" && "${PLE_PATCH_ON}" == 0 ]] || return 1
   [[ "${GPU_MEMORY_UTILIZATION}" == "0.8" ]] || return 1
   [[ "${VLLM_PLE_TABLE_MEMORY}" == "disk" ]] || return 1
   [[ "${B12X_DISK_BACKEND}" == "io_uring" ]] || return 1
@@ -89,7 +90,7 @@ check_cmd() {
   has_pair --dtype bfloat16 || return 1
   has_pair --block-size 16 || return 1
   has_pair --max-model-len 262144 || return 1
-  has_pair --max-num-seqs 5 || return 1
+  has_pair --max-num-seqs 8 || return 1
   has_pair --max-num-batched-tokens 4096 || return 1
   has_pair --gdn-decode-kernel b12x || return 1
   has_pair --linear-backend b12x || return 1
@@ -121,11 +122,12 @@ check_cmd() {
   has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=auto" || return 1
   has_word "--speculative-config" || return 1
   has_word '{"method":"mtp","num_speculative_tokens":3}' || return 1
-  has_pair --kv-cache-memory-bytes 27000000000 || return 1
+  has_pair --kv-cache-memory-bytes 31150000000 || return 1
   has_word --hf-overrides && return 1
   has_word '{"pass_config":{"fuse_act_quant":true}}' || return 1
   has_word "eugr/spark-vllm-b12x:latest" || return 1
   printf '%s\n' "${DOCKER_CMD[@]}" | grep -q 'secret-token' && return 1
+  printf '%s\n' "${DOCKER_CMD[@]}" | grep -q '_disk.py:ro' && return 1
   return 0
 }
 
@@ -198,6 +200,20 @@ pass "environment wins over .env"
   has_pair --gpu-memory-utilization 0.8
 )
 pass "an empty KV_CACHE_MEMORY_BYTES keeps the utilization sizing"
+
+(
+  unset_recipe
+  cd "${tmp}"
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  validate_config
+  [[ -f "${PLE_PATCH_FILE}" ]]
+  grep -q 'queue_depth: int = 256' "${PLE_PATCH_FILE}"
+  PLE_PATCH_ON=1
+  build_docker_cmd
+  has_pair -v "${PLE_PATCH_FILE}:${PLE_DISK_PY}:ro"
+)
+pass "the PLE queue-depth patch exists and mounts read-only once ple_patch_check accepts the image"
 
 (
   unset_recipe
@@ -323,6 +339,7 @@ for bad in \
   'YARN_FACTOR=0' \
   'KV_CACHE_MEMORY_BYTES=30G' \
   'PRECISION=max' \
+  'PLE_QUEUE_DEPTH=128' \
   'B12X_W4A16_A4_PREFILL_TERMS=3' \
   'VLLM_B12X_DENSE_ACTIVATION_MODE=bf16' \
   'MEM_HARD_FLOOR_GIB=9' \
@@ -354,6 +371,7 @@ printf '%s\n' "${dry}" | grep -q 'VLLM_PLE_TABLE_MEMORY=disk' || fail "DRY_RUN d
 printf '%s\n' "${dry}" | grep -q 'eugr/spark-vllm-b12x:latest' || fail "DRY_RUN dropped the image"
 printf '%s\n' "${dry}" | grep -q -- '--network' || fail "DRY_RUN dropped host networking"
 printf '%s\n' "${dry}" | grep -q -- '--gpus' || fail "DRY_RUN dropped --gpus"
+printf '%s\n' "${dry}" | grep -q 'ple_disk_qd256.py' || fail "DRY_RUN dropped the PLE queue-depth patch"
 pass "DRY_RUN=1 ./start.sh prints the docker command"
 
 echo "test_config: ${N} checks passed"

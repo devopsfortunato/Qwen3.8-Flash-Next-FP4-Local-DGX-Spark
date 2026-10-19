@@ -149,6 +149,16 @@ else
   warn "MemAvailable could not be read"
 fi
 
+if (( DRY == 0 )); then
+  ple_patch_check
+elif [[ "${PLE_QUEUE_DEPTH}" == 256 ]]; then
+  PLE_PATCH_ON=1
+  log "DRY_RUN: a real start checks that ${IMAGE} has the expected ${PLE_DISK_PY##*/} before mounting the patch"
+fi
+if [[ "${PLE_PATCH_ON}" == 1 ]]; then
+  log "PLE queue depth 256: ${PLE_PATCH_FILE##*/} mounted read-only"
+fi
+
 build_docker_cmd "$@"
 step 3 "Launch: container ${CONTAINER_NAME}"
 log "docker run ${IMAGE} vllm serve ${MODEL_ID} --port ${PORT}"

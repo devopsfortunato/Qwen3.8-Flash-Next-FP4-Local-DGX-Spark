@@ -27,6 +27,13 @@ b12x
   `--linear-backend b12x`, `--gdn-decode-kernel b12x`).
   https://github.com/eugr/spark-vllm-docker
 
+FlashInfer
+  https://github.com/flashinfer-ai/flashinfer
+  Apache License, Version 2.0.
+  patches/ple_disk_qd256.py is a modified copy of flashinfer/experimental/b12x/sequence/ple_embedding/_disk.py
+  from flashinfer-python 0.7.1, as shipped in the eugr/spark-vllm-b12x image. The only change, noted at the
+  top of the file, raises DiskTable's default io_uring queue depth from 64 to 256.
+
 NVIDIA Qwen3.8-Flash-Next-FP4-Local
   https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local
   Quantized by NVIDIA with Model Optimizer. Governing download terms: NVIDIA Open Model Agreement.
