@@ -42,6 +42,9 @@ v0.32.0 conflict resolutions included (numbering follows eugr's
 | 16-flash-next-fp4 | local (mod `mods/draft/flash-next-fp4`) | ModelOpt mixed-precision dispatch, nested NVFP4 scale loading, opt-in resident CSF expert scales (`VLLM_CSF_RESIDENT`), weight-transfer helpers, post-load host-heap trim | **Required** — ModelOpt mixed/nested-scale loading and the qwen4_exp helpers the loader path uses |
 | 17-flash-next-b12x-loader | local (adapts `local-inference-lab/vllm` `3a947437`) | opt-in `--load-format b12x` checkpoint loading via FlashInfer's reader | Optional — opt-in load path; safetensors loading (with CSF decode) works without it |
 | 18-b12x-nvfp4-a16-k32 | local to this recipe | pad the stored K of b12x NVFP4 W4A16 weights to a multiple of 32, keeping the logical K | **Required** — without it the vision encoder's MLP down projection (K=4304) stops the first boot with `A16 requires stored K32 and N8` |
+| 19-pr58449 | #58449 (`848dbf89`) | fused draft metadata updates for the QSA side cache: the MTP drafter no longer rebuilds QSA attention metadata eagerly on every draft step | **Required for speed** — decode 38.64 → 40.47 t/s |
+| 20-mxfp8-lm-head | local (ports the fork's `VLLM_MXFP8_LM_HEAD`) | the BF16 LM head loads as shipped and is stored and run as MXFP8 (b12x, BF16 activations); target and MTP heads | **Required for speed** — decode 40.47 → 45.45 t/s; on with `VLLM_MXFP8_LM_HEAD=1` (the profile keeps it) |
+| 21-pr58863-recoverssm | #58863 (open) | RecoverSSM for Qwen GDN and the PLE short conv: drafts verify off one GDN state, only accepted tokens are replayed | Optional, off — `--use-replayssm` frees KV memory (1,955,533 instead of 1,751,020 tokens); single-stream decode unchanged |
 
 ## Conflicts resolved against v0.32.0
 
@@ -52,6 +55,11 @@ exactly where v0.32.0's #59604 added the b12x block-codec dispatch
 conditions are disjoint (CSF-encoded NVFP4 weights vs IQ2/Q8_0 codecs).
 Everything else applied via three-way merge or direct apply without manual
 resolution.
+
+Patch 21: `vllm/config/cache.py`, where v0.32.0 still has `use_kda_recoverssm`;
+the PR's rename to `use_recoverssm` is taken together with its Kimi-K3 call
+sites. The PR's `vllm/models/kimi_k3/nvidia/specialized_decode/runtime/__init__.py`
+does not exist in v0.32.0 and is skipped (Kimi-K3 only).
 
 ## FlashInfer
 
@@ -109,7 +117,7 @@ equivalents:
 |---|---|
 | `VLLM_PLE_TABLE_MEMORY=disk` | `--engram-config '{"host_file_gather":true}'` |
 | `--gdn-decode-kernel b12x` | dropped (flag does not exist upstream) |
-| `VLLM_MXFP8_LM_HEAD=1` | dropped (fork-only): the target LM head runs in BF16; the README's precision table measured that at about 6% slower decode on the fork |
+| `VLLM_MXFP8_LM_HEAD=1` | kept: patch 20 implements it on this lane |
 | `VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13` | dropped (fork-only) |
 | `B12X_POLICY_MODE`, `B12X_DISK_BACKEND`, `B12X_W4A16_A4_PREFILL*`, `VLLM_B12X_DENSE_ACTIVATION_MODE`, `PLE_QUEUE_DEPTH` | dropped (fork-only; `PRECISION=quality` has no upstream equivalent) |
 | `{"method":"mtp","num_speculative_tokens":3}` | unchanged: full-vocabulary MTP draft, as in the fork image |
@@ -136,9 +144,9 @@ disables the post-load host-heap trim.
 - `PRECISION=quality` (two-term prefill, BF16 dense activations) is
   fork-only; the upstream lane always runs the default fast path.
 - Numerics differ from the fork image: no FP4 prefill activations
-  (`B12X_W4A16_A4_PREFILL`), no MXFP8 LM head, and upstream kernels in place of
-  the fork's. Logprobs will not be bit-identical to the pinned-image recipe;
-  compare perplexity and the task benchmarks instead.
+  (`B12X_W4A16_A4_PREFILL`) and upstream kernels in place of the fork's.
+  Logprobs are not bit-identical to the pinned-image recipe; see the
+  measurements below.
 - `--load-format b12x` (patch 17) supports TP 1–2 without EP/DP/pipeline/EPLB,
   sleep mode, or standalone weight reload, and rejects other architectures.
 - Patch 17's `read_mode` accepts `auto`/`bounce` only; the fork's shared-GDS
@@ -146,45 +154,38 @@ disables the post-load host-heap trim.
 
 ## Verification status
 
-Verified on x86, no GPU in this environment:
+Measured on one DGX Spark (GB10) against the pinned recipe image
+(`qwen38-flash-next-fp4:61ab709967e0`, eugr nightly-20261015), one stream,
+MTP 3, same campaign scripts (`pbench` 8k/16k/32k cold prefill, `dbench`
+512 greedy tokens on three prompts, `ppl.py` + `cmp.py` on the recipe's
+perplexity texts). Steps measured with Python overlays on the image built
+from patches 1–18, before the final rebuild from the full series:
 
-- All 16 patches apply onto tag v0.32.0 as one commit each; branch
-  `qwen38-flash-next-v0.32.0` in `../vllm-v0.32.0-qwen38`, tree
-  `85567e46546a84221d484a10eb742cb5db4cfe1a`, `git status` clean.
-- All 123 changed `.py` files byte-compile (`python3 -m compileall -q`).
-- Replays verified twice: (1) `git apply --3way` of the exported `series`
-  onto a fresh v0.32.0 worktree reproduces the branch tree exactly; (2) a
-  fresh `git clone --depth 1 --branch v0.32.0` from GitHub plus
-  `git am vllm-0.32/*.patch` applies all 16 patches with no conflicts and
-  produces the same tree hash.
-- CPU test suites with torch 2.13.0+cpu, safetensors, numpy, pytest
-  (`--noconftest --import-mode=importlib`, eugr's documented invocation):
-  `tests/model_executor/model_loader/test_flash_next_b12x_loader.py` +
-  `tests/model_executor/model_loader/test_csf_scales.py` +
-  `tests/model_executor/layers/test_draft_vocab.py` → **36 passed, 5
-  skipped** (the skips are the CUDA/native-reader cases).
-  spark-vllm-docker's own applier regression suite at the pinned commit
-  (`tests/test_regular_patch_series.py`) → **16 passed, 71 subtests passed**.
-- The 10 `test_draft_vocab.py` errors in that run are all
-  `fixture 'default_vllm_config' not found`: the fixture lives in vLLM's
-  shared `tests/conftest.py`, which `--noconftest` deliberately excludes.
-  Re-running the file WITH the conftest gets past the fixture and then fails
-  at vLLM platform init ("Cannot access accelerator device when none is
-  available") — these cases initialize the GPU platform and are not runnable
-  on a CPU-only host; they are not failures of the series code. (The conftest
-  route also needs vLLM's full server dependency set; that was installed and
-  is what moved the errors from fixture-missing to accelerator-missing.)
+| image | prefill t/s | decode t/s | KV tokens (31.15 GB) | perplexity prose+code / fresh / 96k book | vs pinned: mean \|Δlogprob\| / top-1 agree |
+|---|---:|---:|---:|---|---|
+| pinned fork image | 2,411 | 45.58 | 1,575,180 | 1.0902 / 2.2049 / 1.0470 | — |
+| patches 1–18 | 2,598 | 38.64 | 1,751,020 | 1.0868 / 2.2034 / 1.0439 | 0.042 / 98.46% (own repeat noise 0.047) |
+| + 19 | 2,600 | 40.47 | 1,751,020 | — | — |
+| + 19 + 20 (the profile) | 2,633 | 45.45 | 1,751,020 | 1.0872 / 2.2090 / 1.0454 | 0.043 / 98.44% (own repeat noise 0.050) |
+| + 19 + 20 + 21 `--use-replayssm` | 2,586 | 45.75 | 1,955,533 | — | 0.042 / 98.49% |
 
-Not verified (needs the Spark):
+Quality on patches 1–18 (before 19/20): tool-eval-bench 2.8.1 89 · 88
+(pinned 89 · 90), sixcat-eval 0.8.3 90.7 (pinned 92.1; the gap is Tools,
+2 of 20 items, which varies by 10 points between runs of one config).
 
-- Docker image build (vLLM + FlashInfer wheel compilation), checkpoint load,
-  inference, and performance. eugr's README states the same about his lane:
-  GPU build/inference remain for CI.
-- `VLLM_CSF_RESIDENT=1` (resident CSF expert scales): eugr's README marks
-  GPU execution of that path unvalidated; the profile leaves it off and the
-  default loader decodes CSF scales through #60646 instead.
-- `--load-format b12x` (patch 17) is validated by its CPU loader tests only;
-  the native-reader case needs Spark CUDA + FlashInfer.
-- The FlashInfer prebuilt wheel set actually downloaded on the Spark
-  (`prebuilt-flashinfer-current`) is assumed to contain #5863/#5943 as eugr's
-  README describes; not verifiable from here.
+Tried on this lane and left out (no gain at one stream, output unchanged):
+Marlin MoE (39.78 t/s), `FULL_AND_PIECEWISE` CUDA graphs (39.99),
+`--async-scheduling` (38.88), `--max-num-batched-tokens 8192` (39.33), all on
+patches 1–19. Turning off upstream's QSA prepare fusion and merged QSA
+projections leaves prefill at 2,599 t/s and costs decode (37.42), so they are
+not where this lane's prefill lead comes from.
+
+Source checks (x86): the series replays onto a fresh
+`git clone --depth 1 --branch v0.32.0` with `git am` and reproduces tree
+`ffc95be46c72f2aec2d073a9234cd1e7703e949a` (also on the Spark); changed `.py`
+files byte-compile; the CPU loader/CSF/draft-vocab suites pass (36 passed, 5
+CUDA-only skips; 10 `test_draft_vocab.py` cases need vLLM's GPU conftest).
+
+Not verified: `VLLM_CSF_RESIDENT=1` (resident CSF expert scales; eugr marks
+it GPU-unvalidated, the profile leaves it off); RecoverSSM under concurrency,
+where its PR reports its gains; `--load-format b12x` beyond this checkpoint.
