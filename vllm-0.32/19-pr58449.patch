@@ -1,0 +1,259 @@
+From 24198297c1955f8acc0839db85c250ddc5dc6e77 Mon Sep 17 00:00:00 2001
+From: Alfonso Fortunato <57877156+devopsfortunato@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:15:13 +0200
+Subject: [PATCH 1/3] Enable fused draft metadata updates for the QSA side
+ cache
+
+Upstream PR vllm-project/vllm#58449 (head 848dbf89ec), applied with
+git apply --3way on top of 781c2cbcb7.
+
+QSAMetadataBuilder gains supports_draft_decode_metadata_update = HAS_TRITON
+and update_draft_decode_metadata(), which re-launches the existing Triton
+side-cache build kernel in place (capture-safe: fixed shapes/scalars, no
+CPU reads inside the launch path). The speculator (vllm/v1/worker/gpu/
+spec_decode/speculator.py:328) previously saw the QSA group unsupported
+and rebuilt QSA attention metadata eagerly on every MTP draft step
+('QWEN4_EXP_EXP_QSA_STATE cannot update draft decode metadata in place;
+falling back to rebuilding attention metadata eagerly').
+
+Fork comparison: the fork avoids the eager rebuild through its merged
+B12x QSA owner (src-cmp/fork vllm/models/qwen4_exp/nvidia/b12x_qsa.py:214,297)
+where the selector state is updated transactionally inside the fused
+qwen4_exp_b12x_qsa_with_output custom op; its update_draft_decode_metadata
+only resets qsa_num_accepted_tokens. This patch gives the v0.32 Triton
+side-cache path the same no-eager-rebuild property. Extra piece the fork
+has that #58449 lacks: the fork's AttentionCGSupport.ALWAYS builder and
+B12xPagedMetadata builder chain also capture the per-request QSA state
+(slot ids, is_fresh, accepted tokens) into persistent device buffers, so
+nothing at all is rebuilt between draft steps; #58449 still re-launches
+the Triton build kernel per draft step (in-graph, not rebuilt via CPU).
+---
+ tests/models/qwen4_exp/test_qsa_reference.py | 61 ++++++++++++++
+ vllm/models/qwen4_exp/common/qsa_cache.py    | 86 +++++++++++++++++---
+ 2 files changed, 135 insertions(+), 12 deletions(-)
+
+diff --git a/tests/models/qwen4_exp/test_qsa_reference.py b/tests/models/qwen4_exp/test_qsa_reference.py
+index a55cc028f9..bf2f5e37fa 100644
+--- a/tests/models/qwen4_exp/test_qsa_reference.py
++++ b/tests/models/qwen4_exp/test_qsa_reference.py
+@@ -506,6 +506,67 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
+ 
+ 
+ @requires_qsa_kernels
++@requires_qsa_kernels
++@pytest.mark.parametrize("layout", ["plain", "compressed", "circular"])
++def test_qsa_draft_decode_metadata_update_matches_rebuild(layout: str) -> None:
++    """A fused draft step's in-place update equals a fresh build at seq_lens + 1."""
++    device = torch.device("cuda")
++    compress_ratio = 4 if layout != "plain" else 1
++
++    def make_builder() -> QSAMetadataBuilder:
++        builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
++        builder.compress_ratio = compress_ratio
++        builder.reorder_batch_threshold = 1
++        builder.is_circular_buffer = layout == "circular"
++        builder.kv_cache_spec = SimpleNamespace(block_size=4)
++        builder.storage_block_size = 16 if layout == "compressed" else 4
++        builder.token_to_req_buffer = torch.empty(8, dtype=torch.int32, device=device)
++        builder.slot_mapping_buffer = torch.empty(8, dtype=torch.int64, device=device)
++        builder.logical_positions_buffer = torch.empty(
++            8, dtype=torch.int64, device=device
++        )
++        builder.visible_blocks_buffer = torch.empty(8, dtype=torch.int32, device=device)
++        builder.request_capacity = 8
++        builder.k_work_metadata_buffer = torch.empty(
++            8 if layout == "compressed" else 0, 2, dtype=torch.int32, device=device
++        )
++        return builder
++
++    query_start_loc = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
++    token_to_req = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
++
++    def make_common(seq_lens: torch.Tensor) -> SimpleNamespace:
++        return SimpleNamespace(
++            num_actual_tokens=3,
++            num_reqs=3,
++            max_query_len=1,
++            max_seq_len=int(seq_lens.max()),
++            query_start_loc=query_start_loc,
++            query_start_loc_cpu=query_start_loc.cpu(),
++            seq_lens=seq_lens,
++            slot_mapping=torch.tensor([5, 9, 20], dtype=torch.int64, device=device),
++            block_table_tensor=torch.tensor(
++                [[3, 1], [0, 4], [2, 5]], dtype=torch.int32, device=device
++            ),
++            token_to_req_indices=lambda buffer: buffer.copy_(token_to_req),
++        )
++
++    # 7 -> 8 crosses a compression boundary, so visible_blocks must change.
++    seq_lens = torch.tensor([7, 11, 16], dtype=torch.int32, device=device)
++    builder = make_builder()
++    metadata = builder.build(0, make_common(seq_lens))
++    positions_before = metadata.logical_positions.clone()
++
++    seq_lens.add_(1)
++    builder.update_draft_decode_metadata(metadata)
++    expected = make_builder().build(0, make_common(seq_lens.clone()))
++
++    assert not torch.equal(metadata.logical_positions, positions_before)
++    for name in ("token_to_req", "logical_positions", "visible_blocks", "slot_mapping"):
++        torch.testing.assert_close(getattr(metadata, name), getattr(expected, name))
++    torch.testing.assert_close(metadata.k_work_metadata, expected.k_work_metadata)
++
++
+ @pytest.mark.usefixtures("default_vllm_config")
+ def test_qsa_unfused_cache_update_ignores_padded_qk() -> None:
+     """Padded projected Q/K rows must not affect either side cache."""
+diff --git a/vllm/models/qwen4_exp/common/qsa_cache.py b/vllm/models/qwen4_exp/common/qsa_cache.py
+index 35f271e400..c857d129c4 100644
+--- a/vllm/models/qwen4_exp/common/qsa_cache.py
++++ b/vllm/models/qwen4_exp/common/qsa_cache.py
+@@ -404,12 +404,53 @@ def build_qsa_metadata_triton(
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Build QSA side-cache and optional pre-indexer work metadata."""
+     num_tokens = common_attn_metadata.num_actual_tokens
+-    num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
+     token_to_req = token_to_req_buffer[:num_tokens]
+     logical_positions = logical_positions_buffer[:num_tokens]
+     visible_blocks = visible_blocks_buffer[:num_tokens]
+     slot_mapping = slot_mapping_buffer[:num_tokens]
+-    num_reqs = common_attn_metadata.query_start_loc.shape[0] - 1
++    if num_tokens == 0 and k_work_metadata_buffer is None:
++        return token_to_req, logical_positions, visible_blocks, slot_mapping
++    _launch_qsa_metadata_kernel(
++        common_attn_metadata.query_start_loc,
++        common_attn_metadata.seq_lens,
++        common_attn_metadata.slot_mapping,
++        common_attn_metadata.block_table_tensor,
++        token_to_req,
++        logical_positions,
++        visible_blocks,
++        slot_mapping,
++        k_work_metadata_buffer,
++        num_mapped_tokens=int(common_attn_metadata.query_start_loc_cpu[-1]),
++        storage_block_size=storage_block_size,
++        compress_ratio=compress_ratio,
++        circular_buffer_size=circular_buffer_size,
++        request_capacity=request_capacity,
++    )
++    if circular_buffer_size == 0 and compress_ratio == 1:
++        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
++    return token_to_req, logical_positions, visible_blocks, slot_mapping
++
++
++def _launch_qsa_metadata_kernel(
++    query_start_loc: torch.Tensor,
++    seq_lens: torch.Tensor,
++    common_slot_mapping: torch.Tensor,
++    block_table: torch.Tensor,
++    token_to_req: torch.Tensor,
++    logical_positions: torch.Tensor,
++    visible_blocks: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    k_work_metadata_buffer: torch.Tensor | None,
++    *,
++    num_mapped_tokens: int,
++    storage_block_size: int,
++    compress_ratio: int,
++    circular_buffer_size: int,
++    request_capacity: int | None,
++) -> None:
++    """Fill QSA metadata in place; capture-safe given fixed shapes and scalars."""
++    num_tokens = token_to_req.shape[0]
++    num_reqs = query_start_loc.shape[0] - 1
+     assert num_reqs > 0
+ 
+     if k_work_metadata_buffer is not None:
+@@ -423,10 +464,6 @@ def build_qsa_metadata_triton(
+         request_scan_size = 1
+         max_num_work = 0
+ 
+-    if num_tokens == 0 and k_work_metadata_buffer is None:
+-        return token_to_req, logical_positions, visible_blocks, slot_mapping
+-
+-    block_table = common_attn_metadata.block_table_tensor
+     num_search_steps = int(math.ceil(math.log2(num_reqs)))
+     work_search_steps = int(math.ceil(math.log2(num_reqs)))
+     # The same grid covers token tiles and, for the compressed cache, work tiles.
+@@ -435,9 +472,9 @@ def build_qsa_metadata_triton(
+         cdiv(max_num_work, 256) if k_work_metadata_buffer is not None else 0
+     )
+     _build_qsa_metadata_kernel[(max(num_token_blocks, num_work_blocks, 1),)](
+-        common_attn_metadata.query_start_loc,
+-        common_attn_metadata.seq_lens,
+-        common_attn_metadata.slot_mapping,
++        query_start_loc,
++        seq_lens,
++        common_slot_mapping,
+         block_table,
+         token_to_req,
+         logical_positions,
+@@ -462,9 +499,6 @@ def build_qsa_metadata_triton(
+         WORK_BLOCK_SIZE=256,
+         num_warps=4,
+     )
+-    if circular_buffer_size == 0 and compress_ratio == 1:
+-        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
+-    return token_to_req, logical_positions, visible_blocks, slot_mapping
+ 
+ 
+ def _build_qsa_metadata_torch(
+@@ -587,6 +621,8 @@ class QSAForwardMetadata(AttentionMetadata):
+     logical_positions: torch.Tensor
+     visible_blocks: torch.Tensor
+     k_work_metadata: torch.Tensor
++    common_slot_mapping: torch.Tensor
++    num_mapped_tokens: int
+     num_actual_tokens: int
+     num_decodes: int
+     num_decode_tokens: int
+@@ -603,6 +639,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
+     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
+ 
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++    supports_draft_decode_metadata_update = HAS_TRITON
+ 
+     def __init__(
+         self,
+@@ -714,6 +751,8 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
+             logical_positions=logical_positions,
+             visible_blocks=visible_blocks,
+             k_work_metadata=k_work_metadata,
++            common_slot_mapping=common_attn_metadata.slot_mapping,
++            num_mapped_tokens=int(common_attn_metadata.query_start_loc_cpu[-1]),
+             num_actual_tokens=num_tokens,
+             num_decodes=num_decodes,
+             num_decode_tokens=num_decode_tokens,
+@@ -726,6 +765,29 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
+             compress_ratio=self.compress_ratio,
+         )
+ 
++    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:
++        if metadata.num_actual_tokens == 0:
++            return
++        build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
++        _launch_qsa_metadata_kernel(
++            metadata.query_start_loc,
++            metadata.seq_lens,
++            metadata.common_slot_mapping,
++            metadata.block_table,
++            metadata.token_to_req,
++            metadata.logical_positions,
++            metadata.visible_blocks,
++            metadata.slot_mapping,
++            metadata.k_work_metadata if build_k_work else None,
++            num_mapped_tokens=metadata.num_mapped_tokens,
++            storage_block_size=self.storage_block_size,
++            compress_ratio=self.compress_ratio,
++            circular_buffer_size=(
++                self.kv_cache_spec.block_size if self.is_circular_buffer else 0
++            ),
++            request_capacity=self.request_capacity if build_k_work else None,
++        )
++
+ 
+ class QSAStateBackend(AttentionBackend):
+     """Key-only dummy backend for out-of-band QSA side-cache operations."""
+-- 
+2.55.0
+

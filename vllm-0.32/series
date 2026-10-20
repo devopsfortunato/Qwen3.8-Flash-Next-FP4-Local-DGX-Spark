@@ -15,3 +15,6 @@
 16-flash-next-fp4.patch # qwen38 branch commit df73eaf7b8407f7e2c98ae67eaf46ae8a34dd4ac
 17-flash-next-b12x-loader.patch # qwen38 branch commit aeda1aaed97523f3617744df41ee4b7c2bbf4b58
 18-b12x-nvfp4-a16-k32.patch # qwen38 branch commit 781c2cbcb7cdb468eaae3f84b662c91b132b46ee (local to this recipe)
+19-pr58449.patch # qwen38 branch commit 24198297c1955f8acc0839db85c250ddc5dc6e77
+20-mxfp8-lm-head.patch # qwen38 branch commit a58efebbedbbeccb4f6083c22d4be999f150bcf3
+21-pr58863-recoverssm.patch # qwen38 branch commit 6d50ff6ca4bf9b2bb1cd6811400b7a35dc44c326

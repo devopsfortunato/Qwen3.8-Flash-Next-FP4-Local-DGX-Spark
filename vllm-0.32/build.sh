@@ -29,7 +29,7 @@ set -euo pipefail
 SPARK_VLLM_DOCKER_REF="eadf57da73953fe71326dbd10ef45fc793625cf2"
 # The tree every patch of this series produces on top of v0.32.0
 # (replay-verified; see README.md).
-EXPECTED_TREE="98ce4c7828317652d503c5e28379a2dbc7e72225"
+EXPECTED_TREE="ffc95be46c72f2aec2d073a9234cd1e7703e949a"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

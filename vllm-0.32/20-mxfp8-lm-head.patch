@@ -1,0 +1,240 @@
+From a58efebbedbbeccb4f6083c22d4be999f150bcf3 Mon Sep 17 00:00:00 2001
+From: Alfonso Fortunato <57877156+devopsfortunato@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:15:13 +0200
+Subject: [PATCH 2/3] Add opt-in MXFP8 LM head via VLLM_MXFP8_LM_HEAD (fork
+ parity)
+
+Ports the fork's runtime LM head quantization. With VLLM_MXFP8_LM_HEAD=1 (default off), an
+unquantized BF16 ParallelLMHead on a Blackwell 12x device with the b12x MXFP8 linear kernel stores
+its weight as MXFP8 (block-32 scales) and runs the logits GEMM on b12x with BF16 activations, as
+the fork's default VLLM_LM_HEAD_A16=1 does. Checks: BF16 model and params, K%128 == 0,
+N per rank %8 == 0, linear backend auto/b12x, head not tied, B12xMxfp8LinearKernel selected.
+Applies to the target head and the MTP drafter's own head.
+
+The head loads exactly like an unquantized one (_LMHeadBF16Source as the requantization source of
+Mxfp8OnlineLinearMethod) and is quantized once after loading. The online method's own meta-device
+loading does not fit the vocab-parallel loader: the first version of this patch served flat logits
+(every token "!"). online_quantization_timing_context now skips timing for a layer without a quant
+config instead of asserting.
+
+Measured on one DGX Spark with patches 18-19: decode 40.47 -> 45.45 t/s (dbench geomean), output
+text normal, perplexity 1.0872 / 2.2090 / 1.0454 against the fork image's 1.0902 / 2.2049 / 1.0470.
+---
+ vllm/envs.py                                  |   6 +
+ .../layers/vocab_parallel_embedding.py        | 105 ++++++++++++++++++
+ vllm/model_executor/model_loader/utils.py     |   7 +-
+ 3 files changed, 116 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index e2ab0a48d2..f199b63d87 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -131,6 +131,9 @@ if TYPE_CHECKING:
+     VLLM_USE_HW_AGNOSTIC: bool = False
+     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
+     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
++    # Runtime-quantize unquantized (BF16) LM head shards to MXFP8 weights on
++    # Blackwell 12x via the b12x MXFP8 GEMM path (BF16 activations). Opt-in.
++    VLLM_MXFP8_LM_HEAD: bool = False
+     VLLM_DISABLE_PYNCCL: bool = False
+     VLLM_USE_OINK_OPS: bool = False
+     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
+@@ -1244,6 +1247,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         ["cuda", "triton"],
+         case_sensitive=False,
+     ),
++    # Runtime-quantize unquantized (BF16) LM head shards to MXFP8 weights on
++    # Blackwell 12x via the b12x MXFP8 GEMM path (BF16 activations). Opt-in.
++    "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "0"))),
+     # Disable pynccl (using torch.distributed instead)
+     "VLLM_DISABLE_PYNCCL": lambda: (
+         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index cd126e811f..de07af4069 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -3,6 +3,7 @@
+ 
+ from collections.abc import Sequence
+ from dataclasses import dataclass
++from typing import Literal
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -17,6 +18,7 @@ from vllm.distributed import (
+     get_tensor_model_parallel_world_size,
+     tensor_model_parallel_all_reduce,
+ )
++from vllm.logger import init_logger
+ from vllm.model_executor.custom_op import PluggableLayer
+ from vllm.model_executor.determinism.batch_invariant import (
+     linear_batch_invariant,
+@@ -34,9 +36,48 @@ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.model_executor.weight_transfer import copy_weight
+ from vllm.platforms import current_platform
+ 
++logger = init_logger(__name__)
++
+ DEFAULT_VOCAB_PADDING_SIZE = 64
+ 
+ 
++def _supports_default_lm_head_quantization(
++    recipe: Literal["mxfp8"],
++    params_dtype: torch.dtype,
++    input_size: int,
++    output_size: int,
++) -> bool:
++    """Whether an unquantized LM head shard can runtime-quantize to `recipe`.
++
++    Mirrors the eligibility checks of the fork's VLLM_MXFP8_LM_HEAD: BF16
++    model, shard shapes the b12x MXFP8 GEMM accepts unchanged, the b12x
++    linear backend selected, on a Blackwell 12x device.
++    """
++    from vllm.config import get_current_vllm_config
++
++    config = get_current_vllm_config()
++    if (
++        config.model_config is None
++        or config.model_config.dtype != torch.bfloat16
++        or params_dtype != torch.bfloat16
++        or input_size % 128
++        or output_size % 8
++        or config.kernel_config.linear_backend not in ("auto", "b12x")
++        or not current_platform.is_cuda()
++        or not current_platform.is_device_capability_family(120)
++    ):
++        return False
++
++    from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
++    from vllm.model_executor.kernels.linear.mxfp8.b12x import B12xMxfp8LinearKernel
++
++    try:
++        kernel = init_mxfp8_linear_kernel(weight_shape=(output_size, input_size))
++    except ValueError:
++        return False
++    return isinstance(kernel, B12xMxfp8LinearKernel)
++
++
+ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+     """Unquantized method for embeddings."""
+ 
+@@ -93,6 +134,19 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+         return layer
+ 
+ 
++class _LMHeadBF16Source(UnquantizedEmbeddingMethod):
++    """Loads a BF16 LM head exactly as an unquantized one, for runtime requantization.
++
++    The online MXFP8 method's own meta-device loading does not fit the vocab-parallel
++    loader (padded rows), so the head loads through this method and is quantized once,
++    after loading, from the real BF16 tensor.
++    """
++
++    def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
++        return layer.weight
++
++
++
+ def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
+     """Pad the vocab size to the given value."""
+     return ((vocab_size + pad_to - 1) // pad_to) * pad_to
+@@ -264,6 +318,7 @@ class VocabParallelEmbedding(PluggableLayer):
+         reduce_results: bool = True,
+         quant_method: QuantizeMethodBase | None = None,
+         parallel_group: GroupCoordinator | None = None,
++        lm_head_quantization: Literal["mxfp8"] | None = None,
+     ):
+         super().__init__()
+ 
+@@ -321,6 +376,54 @@ class VocabParallelEmbedding(PluggableLayer):
+         if quant_method is None:
+             quant_method = UnquantizedEmbeddingMethod()
+ 
++        # Runtime MXFP8 LM head quantization (opt-in via VLLM_MXFP8_LM_HEAD).
++        # Applies only to ParallelLMHead with a plain BF16 checkpoint head on
++        # Blackwell 12x; the b12x MXFP8 GEMM reads BF16 activations directly,
++        # so logits keep the model dtype while the weight shards are stored
++        # (and GEMMed) as MXFP8 with block-32 scales.
++        head_quantization = lm_head_quantization
++        if head_quantization is None and envs.VLLM_MXFP8_LM_HEAD:
++            head_quantization = "mxfp8"
++        self.runtime_lm_head_quantization: Literal["mxfp8"] | None = None
++        if head_quantization is not None and isinstance(self, ParallelLMHead):
++            from vllm.config import get_current_vllm_config
++            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++            from vllm.model_executor.layers.quantization.online.mxfp8 import (
++                Mxfp8OnlineLinearMethod,
++            )
++
++            unquantized = isinstance(
++                quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
++            )
++            model_config = get_current_vllm_config().model_config
++            tied = getattr(
++                getattr(model_config, "hf_text_config", None),
++                "tie_word_embeddings",
++                False,
++            )
++            default_supported = _supports_default_lm_head_quantization(
++                head_quantization,
++                params_dtype or torch.get_default_dtype(),
++                embedding_dim,
++                self.num_embeddings_per_partition,
++            )
++            if not envs.is_set("VLLM_MXFP8_LM_HEAD") and (
++                not unquantized or tied or not default_supported
++            ):
++                head_quantization = None
++            elif not unquantized:
++                raise ValueError(
++                    "Runtime LM head quantization requires an unquantized "
++                    "LM head checkpoint"
++                )
++            if head_quantization == "mxfp8":
++                quant_method = Mxfp8OnlineLinearMethod()
++                quant_method.set_requantization_source(_LMHeadBF16Source())
++                self.runtime_lm_head_quantization = head_quantization
++                logger.info_once(
++                    "Quantizing LM head shards to MXFP8 with BF16 activations."
++                )
++
+         # If we are making an embedding layer, then our quantization linear
+         # method must implement the embedding operation. If we are another
+         # layer type like ParallelLMHead, this is not important.
+@@ -609,6 +712,7 @@ class ParallelLMHead(VocabParallelEmbedding):
+         *,
+         disable_tp: bool = False,
+         quant_method: QuantizeMethodBase | None = None,
++        lm_head_quantization: Literal["mxfp8"] | None = None,
+     ):
+         self.has_bias = bias
+         super().__init__(
+@@ -621,6 +725,7 @@ class ParallelLMHead(VocabParallelEmbedding):
+             prefix,
+             disable_tp=disable_tp,
+             quant_method=quant_method,
++            lm_head_quantization=lm_head_quantization,
+         )
+         self.quant_config = quant_config
+         if bias:
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index 65d1ff2808..5411349bb7 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -269,8 +269,11 @@ def online_quantization_timing_context(
+     )
+ 
+     assert isinstance(quant_method, (OnlineLinearBase, OnlineMoEMethodBase))
+-    quant_config = layer.quant_config
+-    assert quant_config is not None
++    quant_config = getattr(layer, "quant_config", None)
++    # A runtime-quantized LM head (VLLM_MXFP8_LM_HEAD) has no checkpoint quant config to time against.
++    if quant_config is None:
++        yield
++        return
+     online_quantization_config = (
+         quant_config
+         if isinstance(quant_config, OnlineQuantizationConfig)
+-- 
+2.55.0
+
