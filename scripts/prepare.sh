@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Prepare this machine to serve nvidia/Qwen3.8-Flash-Next-FP4-Local:
 #   1. preflight: docker, disk, a low-memory floor
-#   2. docker pull of IMAGE (eugr/spark-vllm-b12x:latest unless overridden)
+#   2. the image: the recipe image is built from docker/ on top of BASE_IMAGE (pulled by digest when it is
+#      not local); any other IMAGE is pulled
 #   3. the checkpoint in HF_CACHE (~96 GiB; NVIDIA model card)
 #   4. a check that the snapshot is Qwen4-Exp modelopt MIXED_PRECISION and its shards are present
 # ./start.sh runs this when the prepared marker does not match. Safe to re-run.
-# PULL=0 skips the pull and requires the image to already be local.
+# PULL=0 never pulls: the recipe image then needs BASE_IMAGE local, any other IMAGE needs to be local.
 # DRY_RUN=1 prints the plan and does not pull or download.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
@@ -68,12 +69,21 @@ elif ! nvidia-smi -L >/dev/null 2>&1; then
   warn "nvidia-smi failed: is the NVIDIA driver working?"
 fi
 
-have_image=0
+have_image=0 have_base=1
 if command -v docker >/dev/null 2>&1 && docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   have_image=1
 fi
+if is_recipe_image && ! { command -v docker >/dev/null 2>&1 && docker image inspect "${BASE_IMAGE}" >/dev/null 2>&1; }; then
+  have_base=0
+fi
 need_img=0
-if (( have_image == 0 )); then
+if is_recipe_image; then
+  if (( have_base == 0 )); then
+    need_img="${IMAGE_FREE_GB}"
+  elif (( have_image == 0 )); then
+    need_img=1
+  fi
+elif (( have_image == 0 )); then
   need_img="${IMAGE_FREE_GB}"
 elif (( PULL == 1 )); then
   need_img=5
@@ -114,14 +124,32 @@ fi
 log "Disk: ${cache_free} GB free under ${HF_CACHE} (${ckpt_what})"
 
 if (( DRY )); then
-  if (( PULL == 1 )); then
+  if is_recipe_image; then
+    (( have_base == 1 || PULL == 0 )) || log "DRY_RUN: docker pull ${BASE_IMAGE}"
+    (( have_image == 1 )) || log "DRY_RUN: docker build -t ${IMAGE} docker/ (BASE_IMAGE=${BASE_IMAGE})"
+  elif (( PULL == 1 )); then
     log "DRY_RUN: docker pull ${IMAGE}"
   fi
   log "DRY_RUN: download ${MODEL_ID} into ${HF_CACHE}"
   exit 0
 fi
 
-if (( PULL == 1 )); then
+if is_recipe_image; then
+  if (( have_base == 1 )); then
+    log "Base image ${BASE_IMAGE} is local"
+  elif (( PULL == 1 )); then
+    log "Pulling ${BASE_IMAGE}"
+    docker pull "${BASE_IMAGE}"
+  else
+    die "base image ${BASE_IMAGE} is not local and PULL=0"
+  fi
+  if (( have_image == 1 )); then
+    log "Recipe image ${IMAGE} is local"
+  else
+    log "Building ${IMAGE} from docker/ on ${BASE_IMAGE}"
+    docker build --pull=false --build-arg "BASE_IMAGE=${BASE_IMAGE}" -t "${IMAGE}" "${RECIPE_DOCKER_DIR}"
+  fi
+elif (( PULL == 1 )); then
   log "Pulling ${IMAGE}"
   docker pull "${IMAGE}"
 elif (( have_image == 0 )); then
@@ -129,7 +157,7 @@ elif (( have_image == 0 )); then
 else
   log "PULL=0: using local image ${IMAGE}"
 fi
-docker image inspect "${IMAGE}" >/dev/null 2>&1 || die "image ${IMAGE} is not present after pull"
+docker image inspect "${IMAGE}" >/dev/null 2>&1 || die "image ${IMAGE} is not present after pull or build"
 
 download_model() {
   local -a rev_args=() token_args=()

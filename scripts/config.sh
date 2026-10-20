@@ -39,7 +39,14 @@ fi
 # Checkpoint and container. Flags match the NVIDIA model card's DGX Spark command.
 MODEL_ID="${MODEL_ID:-nvidia/Qwen3.8-Flash-Next-FP4-Local}"
 MODEL_REVISION="${MODEL_REVISION:-}"
-IMAGE="${IMAGE:-eugr/spark-vllm-b12x:latest}"
+# The serve image is built here (docker/) on top of BASE_IMAGE, eugr's B12X build pinned by digest: the
+# nightly every benchmark in the README ran on. A new eugr nightly changes nothing until BASE_IMAGE does.
+# The tag hashes BASE_IMAGE and docker/, so a change to either builds a new image. IMAGE set to anything
+# else (eugr/spark-vllm-b12x:latest, say) is pulled and served as is, without PLE_QUEUE_DEPTH.
+BASE_IMAGE="${BASE_IMAGE:-eugr/spark-vllm-b12x@sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595}"
+RECIPE_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker"
+RECIPE_IMAGE="qwen38-flash-next-fp4:$( { printf '%s\n' "${BASE_IMAGE}"; cat "${RECIPE_DOCKER_DIR}/Dockerfile" "${RECIPE_DOCKER_DIR}/ple_queue_depth.py"; } | sha256sum | cut -c 1-12)"
+IMAGE="${IMAGE:-${RECIPE_IMAGE}}"
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-fp4}"
 SERVED_NAME="${SERVED_NAME:-${MODEL_ID}}"
 
@@ -98,16 +105,10 @@ export VLLM_MXFP8_LM_HEAD="${VLLM_MXFP8_LM_HEAD:-1}"
 export VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE="${VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE:-w13}"
 export VLLM_B12X_MOE_FP4_FORCE_A16="${VLLM_B12X_MOE_FP4_FORCE_A16:-1}"
 export B12X_W4A16_A4_PREFILL="${B12X_W4A16_A4_PREFILL:-1}"
-# Reads in flight for the PLE n-gram table on NVMe (README, PLE queue depth). The image hard-codes 64. 256
-# mounts patches/ple_disk_qd256.py, the image's own file with only that number changed, read-only over the
-# original: prefill about 4% faster, identical output. start.sh mounts it only when the image's file is the
-# one the patch was made from (PLE_DISK_SHA256); otherwise it warns and serves with 64. 64 mounts nothing.
+# Reads in flight for the PLE n-gram table on NVMe (README, PLE queue depth). eugr's image hard-codes 64;
+# the recipe image reads this variable instead (docker/ple_queue_depth.py). 256: prefill about 4% faster,
+# identical output. Other images ignore it.
 PLE_QUEUE_DEPTH="${PLE_QUEUE_DEPTH:-256}"
-PLE_DISK_PY="/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/sequence/ple_embedding/_disk.py"
-PLE_DISK_SHA256="2232d15d5034d9c0cfb9dc3bdbf0e3f49bcc619f51c9ccee77364a0553c6ddeb"
-PLE_PATCH_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/patches/ple_disk_qd256.py"
-# Set by ple_patch_check: 1 when the patch is mounted.
-PLE_PATCH_ON=0
 # Activation precision (README, Precision). fast (the default): the model card's settings, one FP4 term for
 # prefill MoE activations and the dense format the autotuner picks for speed. quality: an FP4 residual term on
 # top, and BF16 activations in the dense NVFP4/MXFP8 layers; closer to full precision token by token, about 21%
@@ -141,6 +142,7 @@ SPARK_ENV=(
   B12X_W4A16_A4_PREFILL
   B12X_W4A16_A4_PREFILL_TERMS
   VLLM_B12X_DENSE_ACTIVATION_MODE
+  PLE_QUEUE_DEPTH
   HF_HUB_OFFLINE
 )
 
@@ -223,6 +225,9 @@ validate_config() {
   fi
   if [[ -z "${IMAGE}" ]]; then
     die "IMAGE is empty"
+  fi
+  if [[ -z "${BASE_IMAGE}" ]]; then
+    die "BASE_IMAGE is empty"
   fi
   if [[ -z "${CONTAINER_NAME}" || ! "${CONTAINER_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
     die "CONTAINER_NAME is not a docker name: ${CONTAINER_NAME}"
@@ -342,18 +347,9 @@ validate_config() {
   fi
 }
 
-# PLE_PATCH_ON=1 when PLE_QUEUE_DEPTH is 256 and the image's _disk.py is the file the patch was made from.
-# Any other image keeps its own file: a patch made from different code could change the model.
-ple_patch_check() {
-  PLE_PATCH_ON=0
-  [[ "${PLE_QUEUE_DEPTH}" == 256 ]] || return 0
-  local sum
-  sum="$(docker run --rm --entrypoint sha256sum "${IMAGE}" "${PLE_DISK_PY}" 2>/dev/null | cut -d ' ' -f 1)" || sum=""
-  if [[ "${sum}" == "${PLE_DISK_SHA256}" ]]; then
-    PLE_PATCH_ON=1
-  else
-    warn "${IMAGE} has a different ${PLE_DISK_PY##*/} (sha256 ${sum:-unreadable}): PLE queue depth stays 64"
-  fi
+# True when IMAGE is the image built from docker/: prepare.sh builds it, and PLE_QUEUE_DEPTH applies.
+is_recipe_image() {
+  [[ "${IMAGE}" == "${RECIPE_IMAGE}" ]]
 }
 
 # --hf-overrides for YaRN. vLLM replaces rope_parameters as a whole, so every key of the checkpoint's
@@ -391,9 +387,6 @@ build_docker_cmd() {
   done
   if [[ -n "${HF_TOKEN:-}" ]]; then
     DOCKER_CMD+=(-e HF_TOKEN)
-  fi
-  if [[ "${PLE_PATCH_ON}" == 1 ]]; then
-    DOCKER_CMD+=(-v "${PLE_PATCH_FILE}:${PLE_DISK_PY}:ro")
   fi
   DOCKER_CMD+=(
     -e "HF_HOME=/root/.cache/huggingface"

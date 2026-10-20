@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Serve nvidia/Qwen3.8-Flash-Next-FP4-Local with vLLM on one DGX Spark.
-# Runs scripts/prepare.sh when the image or the checkpoint is not ready, starts
-# eugr/spark-vllm-b12x on port 8000, waits until /v1/models answers, then runs a smoke test.
+# Runs scripts/prepare.sh when the image or the checkpoint is not ready, starts the recipe image
+# (eugr/spark-vllm-b12x pinned by digest, built by prepare.sh) on port 8000, waits until /v1/models
+# answers, then runs a smoke test.
 # Stop it with ./stop.sh.
 #
 # Usage: ./start.sh [restart|stop] [extra vllm serve args]
@@ -105,7 +106,7 @@ fi
 
 if (( DRY == 0 )); then
   command -v docker >/dev/null 2>&1 || die "docker is not installed"
-  docker image inspect "${IMAGE}" >/dev/null 2>&1 || die "image ${IMAGE} is missing (scripts/prepare.sh pulls it)"
+  docker image inspect "${IMAGE}" >/dev/null 2>&1 || die "image ${IMAGE} is missing (scripts/prepare.sh builds or pulls it)"
   snapshot_dir >/dev/null 2>&1 || die "${MODEL_ID} is not in ${HF_CACHE} (scripts/prepare.sh downloads it)"
 else
   command -v docker >/dev/null 2>&1 || warn "DRY_RUN: docker is not installed"
@@ -149,14 +150,10 @@ else
   warn "MemAvailable could not be read"
 fi
 
-if (( DRY == 0 )); then
-  ple_patch_check
-elif [[ "${PLE_QUEUE_DEPTH}" == 256 ]]; then
-  PLE_PATCH_ON=1
-  log "DRY_RUN: a real start checks that ${IMAGE} has the expected ${PLE_DISK_PY##*/} before mounting the patch"
-fi
-if [[ "${PLE_PATCH_ON}" == 1 ]]; then
-  log "PLE queue depth 256: ${PLE_PATCH_FILE##*/} mounted read-only"
+if is_recipe_image; then
+  log "PLE queue depth ${PLE_QUEUE_DEPTH} (${IMAGE}, built from ${BASE_IMAGE})"
+elif [[ "${PLE_QUEUE_DEPTH}" != 64 ]]; then
+  warn "${IMAGE} is not the recipe image: PLE_QUEUE_DEPTH=${PLE_QUEUE_DEPTH} has no effect there"
 fi
 
 build_docker_cmd "$@"

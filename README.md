@@ -8,7 +8,8 @@
 </p>
 
 Serve **nvidia/Qwen3.8-Flash-Next-FP4-Local** from one NVIDIA DGX Spark through an OpenAI-compatible API.
-The server is vLLM, in the container `eugr/spark-vllm-b12x:latest`, with the DGX Spark flags from the
+The server is vLLM, in `eugr/spark-vllm-b12x` pinned by digest (nightly-20261015) with one small layer built
+here (see [Image](#image)), with the DGX Spark flags from the
 [NVIDIA model card](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local): PLE (n-gram) tables on disk,
 `--load-format b12x`, `--quantization modelopt_mixed`, and FP8 KV cache. MTP drafts 3 tokens, not the model
 card's 4: on a Spark it decodes as fast and leaves 4-9% more KV cache (see [Benchmarks](#benchmarks)).
@@ -38,7 +39,8 @@ cd Qwen3.8-Flash-Next-FP4-Local-DGX-Spark
 ./start.sh
 ```
 
-The first run pulls the image and downloads the checkpoint into `~/.cache/huggingface` if it is not there yet.
+The first run pulls the pinned base image, builds the recipe image on it, and downloads the checkpoint into
+`~/.cache/huggingface` if it is not there yet.
 Later starts load the weights. `start.sh` waits until `/v1/models` answers, runs a smoke test, prints
 `nvidia/Qwen3.8-Flash-Next-FP4-Local is now LIVE! on port 8000`, and returns you to the shell.
 
@@ -84,7 +86,7 @@ docker logs -f qwen38-flash-next-fp4
 - Docker with the NVIDIA container runtime, and your user in the `docker` group.
 - Disk for a fresh machine: about 96 GiB for the checkpoint under `HF_CACHE` and space for the image under
   Docker's root. `scripts/prepare.sh` checks both (`MIN_FREE_GB` 120 when the snapshot is absent,
-  `IMAGE_FREE_GB` 30 when the image is not local).
+  `IMAGE_FREE_GB` 30 when the base image is not local).
 - Optional: the `hf` CLI on the host. Without it, `prepare.sh` downloads from inside the container.
   A Hugging Face token in `HF_TOKEN` or `~/.cache/huggingface/token` when the Hub requires one.
 
@@ -109,7 +111,8 @@ to `vllm serve` (`./start.sh restart --max-model-len 131072`).
 **`scripts/prepare.sh`:**
 
 1. Preflight: Docker, disk, the memory floor.
-2. `docker pull` of `IMAGE` (`PULL=0` uses a local image and does not pull).
+2. The image: pull `BASE_IMAGE` by digest when it is not local, then build the recipe image from `docker/`
+   when it is not local. Any other `IMAGE` is pulled instead. `PULL=0` never pulls.
 3. The checkpoint, into `HF_CACHE`.
 4. A check that it is `qwen4_exp`, ModelOpt `MIXED_PRECISION`, and that every shard named by the index is present.
 
@@ -127,7 +130,8 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MODEL_ID` | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | Hugging Face checkpoint |
-| `IMAGE` | `eugr/spark-vllm-b12x:latest` | vLLM container with the B12X kernels |
+| `BASE_IMAGE` | `eugr/spark-vllm-b12x@sha256:03a956544e9f…` | eugr's B12X vLLM build the recipe image is built on (see [Image](#image)) |
+| `IMAGE` | `qwen38-flash-next-fp4:<hash>` | the recipe image built from `docker/`; set another image to serve that one as is |
 | `PORT` / `HOST` | `8000` / `0.0.0.0` | where the API listens |
 | `SERVED_NAME` | the model id | id returned by `/v1/models` |
 | `MAX_MODEL_LEN` | `262144` | prompt + reply window (`--max-model-len`) |
@@ -148,18 +152,18 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | `DTYPE` | `bfloat16` | model dtype |
 | `VLLM_PLE_TABLE_MEMORY` | `disk` | n-gram table on disk, as on the model card |
 | `B12X_DISK_BACKEND` | `io_uring` | how that table is read |
-| `PLE_QUEUE_DEPTH` | `256` | table reads in flight; `256` mounts `patches/ple_disk_qd256.py`, `64` is the image as shipped (see [PLE queue depth](#ple-queue-depth)) |
+| `PLE_QUEUE_DEPTH` | `256` | table reads in flight; `64` is eugr's image as shipped; the recipe image only (see [PLE queue depth](#ple-queue-depth)) |
 | `CUTE_DSL_ARCH` | `sm_121a` | GB10 architecture for the CuTe DSL kernels |
 | `HF_CACHE` | `~/.cache/huggingface` | where the checkpoint is stored |
 | `MEM_NEED_GIB` | `90` | `MemAvailable` `start.sh` asks for before launch |
 | `MEM_FLOOR_GIB` | `6` | stop the load if free memory stays below this for `MEM_FLOOR_GRACE` (30 s) |
 | `MEM_HARD_FLOOR_GIB` | `2` | stop the load at once below this |
 | `MIN_FREE_GB` | `120` | disk `prepare.sh` asks for when the snapshot is absent |
-| `IMAGE_FREE_GB` | `30` | disk asked for when the image is not local |
+| `IMAGE_FREE_GB` | `30` | disk asked for when the base image is not local |
 | `CONTAINER_NAME` | `qwen38-flash-next-fp4` | docker name |
 | `WAIT_TIMEOUT` | `1800` | seconds to wait for `/v1/models` |
 | `PREPARE` | `auto` | `1` always runs prepare, `0` skips it |
-| `PULL` | `1` | `docker pull` during prepare |
+| `PULL` | `1` | pull the base image (or another `IMAGE`) during prepare when needed |
 | `HF_HUB_OFFLINE` | `1` | serve container; prepare turns it off for the download |
 
 The container also receives the rest of the model-card Spark environment:
@@ -316,10 +320,28 @@ noise (45.7 against 45.0 t/s).
 The output is bit-identical: every token's logprob on the perplexity texts (prose, code, fresh 2026 texts and
 a 96k-token book) matches the 64 run exactly. The same rows are read; only how many at once changes.
 
-The image has no setting for it, so `start.sh` mounts `patches/ple_disk_qd256.py` read-only over the image's
-file. It is the image's own file with that one number changed. Before mounting it, `start.sh` checks the
-image's file against the sha256 the patch was made from; with any other image it warns and serves with 64.
-`PLE_QUEUE_DEPTH=64` turns it off.
+eugr's image has no setting for it, so the recipe image changes that one default to read `PLE_QUEUE_DEPTH`
+(`docker/ple_queue_depth.py`). The build checks the file against the sha256 the change was written for and
+stops on any other file, then imports it to confirm the default is 256, and 64 with `PLE_QUEUE_DEPTH=64`.
+`PLE_QUEUE_DEPTH=64` serves as eugr ships it.
+
+## Image
+
+`IMAGE` defaults to `qwen38-flash-next-fp4:<hash>`, built by `scripts/prepare.sh` from `docker/Dockerfile`
+on top of `BASE_IMAGE`, `eugr/spark-vllm-b12x@sha256:03a956544e9f…` (nightly-20261015, the image every
+benchmark here ran on). The layer adds only the [PLE queue depth](#ple-queue-depth) setting; vLLM, FlashInfer,
+and the B12X kernels are eugr's build unchanged.
+
+The base is pinned by digest, so eugr's nightly `latest` moving does not change what this recipe serves.
+The tag is a hash of `BASE_IMAGE` and `docker/`: changing either builds a new image on the next start.
+To try a newer eugr nightly, set `BASE_IMAGE` to its digest and compare it against the numbers below:
+
+```bash
+BASE_IMAGE=eugr/spark-vllm-b12x@sha256:<digest> ./start.sh restart
+```
+
+The build stops if that nightly ships a different PLE file. `IMAGE=eugr/spark-vllm-b12x@sha256:<digest>`
+serves a base image as is, at queue depth 64.
 
 ## Benchmarks
 
@@ -530,8 +552,11 @@ a second quant of the FP4-Local checkpoint.
 - **Slow first start.** The first load compiles kernels and reads about 96 GiB; later starts are faster.
   Changing `MAX_NUM_SEQS` rebuilds part of the kernel cache on the next start, about 5 minutes. Follow it with
   `docker logs -f qwen38-flash-next-fp4`.
-- **Unknown quantization or load format.** You are not on `eugr/spark-vllm-b12x`; upstream vLLM cannot read this
-  checkpoint's NVFP4 scales yet. Keep the default `IMAGE`.
+- **Unknown quantization or load format.** You are not on `eugr/spark-vllm-b12x` or the recipe image built on
+  it; upstream vLLM cannot read this checkpoint's NVFP4 scales yet. Keep the default `IMAGE`.
+- **`sha256 …, expected …` while building the image.** `BASE_IMAGE` ships a different PLE disk file than the
+  one the queue-depth change was written for. Keep the default `BASE_IMAGE`, or serve that base as is with
+  `IMAGE=<the base image>`.
 
 ## Checks
 
@@ -551,7 +576,7 @@ scripts/config.sh        settings and build_docker_cmd
 scripts/prepare.sh       pull the image, download the checkpoint
 scripts/test_config.sh   config checks
 profiles/                opt-in launch profiles (kv-max, 1m)
-patches/                 ple_disk_qd256.py, mounted read-only for PLE_QUEUE_DEPTH=256
+docker/                  the recipe image: Dockerfile and the PLE queue-depth build step
 docs/                    benchmark charts
 .env.example             commented overrides
 CREDITS.md               what this builds on
@@ -571,8 +596,8 @@ The checkpoint downloaded by `scripts/prepare.sh` is not part of this repository
 - **Qwen Community License 1.0** governs the Qwen3.8-Flash-Next base model.
   https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE
 
-The container `eugr/spark-vllm-b12x:latest` is pulled, not built here. Its NVIDIA software and vLLM build stay
-under their own licenses. See `NOTICE`.
+The base image `eugr/spark-vllm-b12x` is pulled, not rebuilt here; `docker/` adds one layer on top of it. Its
+NVIDIA software and vLLM build stay under their own licenses. See `NOTICE`.
 
 ## Credits
 
