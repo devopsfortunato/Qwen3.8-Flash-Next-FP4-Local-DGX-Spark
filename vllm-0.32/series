@@ -14,3 +14,4 @@
 15-package-draft-vocab.patch # qwen38 branch commit 4ed49b1c7bf6a8d6ccf150c83eec66faac2547d7
 16-flash-next-fp4.patch # qwen38 branch commit df73eaf7b8407f7e2c98ae67eaf46ae8a34dd4ac
 17-flash-next-b12x-loader.patch # qwen38 branch commit aeda1aaed97523f3617744df41ee4b7c2bbf4b58
+18-b12x-nvfp4-a16-k32.patch # qwen38 branch commit 781c2cbcb7cdb468eaae3f84b662c91b132b46ee (local to this recipe)

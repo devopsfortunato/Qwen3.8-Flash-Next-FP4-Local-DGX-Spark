@@ -191,7 +191,7 @@ read as data, and `.env` and the environment still win over it. The default need
 | none | 262,144 | 31.15 GB | 1,575,180 | 6.0 | the default; cap 8; lowest `MemAvailable` while serving 6.9 GiB; floor 6 GiB |
 | `kv-max` | 262,144 | 34 GB | 1,719,161 | 6.6 | cap 6; lowest `MemAvailable` while serving 4.4 GiB; floor 4 GiB |
 | `1m` | 1,048,576 | 30 GB | 1,931,132 | 1.8 | test profile: YaRN 4x, floor 4 GiB |
-| `vllm-0.32` | 262,144 | 31.15 GB | 1,575,180 | 6.0 | upstream vLLM v0.32.0 lane: same pool as the default, fork-only flags replaced (see `vllm-0.32/README.md`); requires `IMAGE=` from `vllm-0.32/build.sh`, unverified on GPU |
+| `vllm-0.32` | 262,144 | 31.15 GB | 1,751,020 | 6.7 | upstream vLLM v0.32.0 plus `vllm-0.32/series`, image built by `vllm-0.32/build.sh`; fork-only flags replaced (see `vllm-0.32/README.md`) |
 
 The default pool is pinned at 31.15 GB: 1,575,180 FP8 tokens, six full 262,144-token requests at once. Up to 8
 requests decode together, and all 8 fit while they average under about 196k tokens each. Past that vLLM pauses

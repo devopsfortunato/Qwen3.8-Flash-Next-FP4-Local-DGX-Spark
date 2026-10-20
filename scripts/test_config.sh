@@ -28,7 +28,7 @@ unset_recipe() {
     MEM_NEED_GIB MEM_FLOOR_GIB MEM_FLOOR_GRACE MEM_HARD_FLOOR_GIB MEM_CHECK WAIT_TIMEOUT STOP_TIMEOUT \
     STOP_LOCK_WAIT PREPARE PULL DRY_RUN FOREGROUND PROFILE PROFILE_DIR PROFILE_FILE \
     KV_CACHE_MEMORY_BYTES YARN_FACTOR NATIVE_MAX_LEN EXTRA_ENV PLE_QUEUE_DEPTH \
-    ENGRAM_CONFIG SPARK_ENV_OMIT || true
+    ENGRAM_CONFIG SPARK_ENV_OMIT KERNEL_CACHE_DIR || true
 }
 
 has_pair() {
@@ -371,6 +371,9 @@ done
   has_pair --quantization modelopt_mixed
   has_pair --linear-backend b12x
   has_pair --moe-backend b12x
+  # Its kernels compile into their own caches, never the default image's.
+  has_pair -v "${HOME}/.cache/qwen38-vllm032/b12x:/root/.cache/b12x"
+  has_pair -v "${HOME}/.cache/qwen38-vllm032/flashinfer:/root/.cache/flashinfer"
 )
 pass "PROFILE=vllm-0.32 swaps fork-only flags for the regular-lane equivalents"
 

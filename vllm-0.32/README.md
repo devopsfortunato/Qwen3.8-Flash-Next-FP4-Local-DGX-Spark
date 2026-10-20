@@ -41,6 +41,7 @@ v0.32.0 conflict resolutions included (numbering follows eugr's
 | 15-package-draft-vocab | local | `setup.py` package-data rule so the wheel ships the draft vocabulary | Optional — goes with 13 |
 | 16-flash-next-fp4 | local (mod `mods/draft/flash-next-fp4`) | ModelOpt mixed-precision dispatch, nested NVFP4 scale loading, opt-in resident CSF expert scales (`VLLM_CSF_RESIDENT`), weight-transfer helpers, post-load host-heap trim | **Required** — ModelOpt mixed/nested-scale loading and the qwen4_exp helpers the loader path uses |
 | 17-flash-next-b12x-loader | local (adapts `local-inference-lab/vllm` `3a947437`) | opt-in `--load-format b12x` checkpoint loading via FlashInfer's reader | Optional — opt-in load path; safetensors loading (with CSF decode) works without it |
+| 18-b12x-nvfp4-a16-k32 | local to this recipe | pad the stored K of b12x NVFP4 W4A16 weights to a multiple of 32, keeping the logical K | **Required** — without it the vision encoder's MLP down projection (K=4304) stops the first boot with `A16 requires stored K32 and N8` |
 
 ## Conflicts resolved against v0.32.0
 

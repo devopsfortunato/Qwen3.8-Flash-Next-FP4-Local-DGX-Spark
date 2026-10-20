@@ -1,0 +1,83 @@
+From 781c2cbcb7cdb468eaae3f84b662c91b132b46ee Mon Sep 17 00:00:00 2001
+From: Alfonso Fortunato <57877156+devopsfortunato@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:57:34 +0200
+Subject: [PATCH] Pad the stored K of b12x NVFP4 W4A16 weights to 32
+
+b12x A16 GEMMs require a stored K that is a multiple of 32. Qwen3.8 Flash
+Next's vision MLP down projection has K=4304 (K%16 == 0 only), so the
+encoder profile run failed with "A16 requires stored K32 and N8" on
+upstream v0.32.0. Zero-pad the packed values and block scales to the next
+multiple of 32 (no 16-element quantization group is split) and keep the
+logical K on the packed weight, so callers keep passing K-wide BF16
+activations. Same storage alignment as local-inference-lab/vllm's b12x
+NVFP4 linear kernel. Local to this recipe; no upstream PR yet.
+---
+ .../kernels/linear/nvfp4/b12x.py              | 30 +++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/model_executor/kernels/linear/nvfp4/b12x.py b/vllm/model_executor/kernels/linear/nvfp4/b12x.py
+index 6cbd0e3a82..11a31ae8aa 100644
+--- a/vllm/model_executor/kernels/linear/nvfp4/b12x.py
++++ b/vllm/model_executor/kernels/linear/nvfp4/b12x.py
+@@ -3,6 +3,8 @@
+ 
+ from __future__ import annotations
+ 
++from dataclasses import replace
++
+ import torch
+ 
+ from vllm._custom_ops import scaled_fp4_quant
+@@ -142,15 +144,39 @@ class B12xNvFp4W4A16LinearKernel(B12xNvFp4LinearKernel):
+     """BF16 x NVFP4 GEMM without activation quantization."""
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        # b12x A16 GEMMs need the stored K to be a multiple of 32. Some layers
++        # (Qwen3.8 Flash Next's vision MLP down projection, K=4304) are only
++        # K%16 == 0: zero-pad the stored values and block scales to the next
++        # 32 without splitting a 16-element quantization group, and keep the
++        # logical K so callers still pass K-wide activations.
++        n, packed_k = map(int, layer.weight.shape)
++        logical_k = packed_k * 2
++        if logical_k % 32:
++            stored_k = (logical_k + 31) // 32 * 32
++            values = torch.zeros(
++                (n, stored_k // 2),
++                dtype=layer.weight.dtype,
++                device=layer.weight.device,
++            )
++            values[:, :packed_k].copy_(layer.weight.data)
++            scales = torch.zeros(
++                (n, stored_k // 16),
++                dtype=layer.weight_scale.dtype,
++                device=layer.weight_scale.device,
++            )
++            scales[:, : logical_k // 16].copy_(layer.weight_scale.data)
++            replace_parameter(layer, "weight", values)
++            replace_parameter(layer, "weight_scale", scales)
+         super().process_weights_after_loading(layer)
+         blockscaled = _import_b12x_blockscaled()
+         assert blockscaled is not None
+-        layer.b12x_nvfp4_packed_weight = blockscaled.pack_weight(
++        packed = blockscaled.pack_weight(
+             layer.weight,
+             layer.weight_scale,
+             recipe="nvfp4",
+             global_scale=layer.weight_global_scale,
+         )
++        layer.b12x_nvfp4_packed_weight = replace(packed, in_features=logical_k)
+ 
+     def get_b12x_warmup_unit(
+         self,
+@@ -161,7 +187,7 @@ class B12xNvFp4W4A16LinearKernel(B12xNvFp4LinearKernel):
+         def compile() -> None:
+             for tokens in token_counts:
+                 source = torch.zeros(
+-                    (tokens, layer.weight.shape[1] * 2),
++                    (tokens, layer.b12x_nvfp4_packed_weight.in_features),
+                     dtype=output_dtype,
+                     device=layer.weight.device,
+                 )
+-- 
+2.55.0
+

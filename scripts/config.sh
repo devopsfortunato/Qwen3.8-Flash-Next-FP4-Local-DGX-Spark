@@ -181,6 +181,16 @@ apply_spark_env_omit() {
 apply_spark_env_omit
 
 HF_CACHE="${HF_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}}"
+# Kernel caches. A profile that serves a different vLLM/FlashInfer build sets KERNEL_CACHE_DIR so its
+# compiled kernels never mix with the default image's (both write b12x, FlashInfer and Triton caches).
+KERNEL_CACHE_DIR="${KERNEL_CACHE_DIR:-}"
+if [[ -n "${KERNEL_CACHE_DIR}" ]]; then
+  [[ "${KERNEL_CACHE_DIR}" == /* ]] || KERNEL_CACHE_DIR="${HOME}/${KERNEL_CACHE_DIR}"
+  VLLM_CACHE="${VLLM_CACHE:-${KERNEL_CACHE_DIR}/vllm}"
+  FLASHINFER_CACHE="${FLASHINFER_CACHE:-${KERNEL_CACHE_DIR}/flashinfer}"
+  TRITON_CACHE="${TRITON_CACHE:-${KERNEL_CACHE_DIR}/triton}"
+  B12X_CACHE="${B12X_CACHE:-${KERNEL_CACHE_DIR}/b12x}"
+fi
 VLLM_CACHE="${VLLM_CACHE:-${HOME}/.cache/vllm}"
 FLASHINFER_CACHE="${FLASHINFER_CACHE:-${HOME}/.cache/flashinfer}"
 TRITON_CACHE="${TRITON_CACHE:-${HOME}/.triton}"
