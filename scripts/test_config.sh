@@ -27,7 +27,7 @@ unset_recipe() {
     FLASHINFER_CACHE TRITON_CACHE B12X_CACHE STATE_DIR LOG_DIR MIN_FREE_GB IMAGE_FREE_GB \
     MEM_NEED_GIB MEM_FLOOR_GIB MEM_FLOOR_GRACE MEM_HARD_FLOOR_GIB MEM_CHECK WAIT_TIMEOUT STOP_TIMEOUT \
     STOP_LOCK_WAIT PREPARE PULL DRY_RUN FOREGROUND PROFILE PROFILE_DIR PROFILE_FILE \
-    KV_CACHE_MEMORY_BYTES YARN_FACTOR NATIVE_MAX_LEN EXTRA_ENV PLE_QUEUE_DEPTH || true
+    KV_CACHE_MEMORY_BYTES YARN_FACTOR NATIVE_MAX_LEN EXTRA_ENV PLE_QUEUE_DEPTH DRAFT_VOCAB || true
 }
 
 has_pair() {
@@ -62,6 +62,7 @@ check_defaults() {
   [[ "${MAX_MODEL_LEN}" == "262144" ]] || return 1
   [[ "${MAX_NUM_SEQS}" == "8" ]] || return 1
   [[ "${PLE_QUEUE_DEPTH}" == "256" && "${PLE_PATCH_ON}" == 0 ]] || return 1
+  [[ "${DRAFT_VOCAB}" == "full" && "${DV_PATCH_ON}" == 0 ]] || return 1
   [[ "${GPU_MEMORY_UTILIZATION}" == "0.8" ]] || return 1
   [[ "${VLLM_PLE_TABLE_MEMORY}" == "disk" ]] || return 1
   [[ "${B12X_DISK_BACKEND}" == "io_uring" ]] || return 1
@@ -128,6 +129,7 @@ check_cmd() {
   has_word "eugr/spark-vllm-b12x:latest" || return 1
   printf '%s\n' "${DOCKER_CMD[@]}" | grep -q 'secret-token' && return 1
   printf '%s\n' "${DOCKER_CMD[@]}" | grep -q '_disk.py:ro' && return 1
+  printf '%s\n' "${DOCKER_CMD[@]}" | grep -q -e 'mtp.py:ro' -e 'VLLM_MTP_DRAFT_VOCAB' && return 1
   return 0
 }
 
@@ -213,7 +215,31 @@ pass "an empty KV_CACHE_MEMORY_BYTES keeps the utilization sizing"
   build_docker_cmd
   has_pair -v "${PLE_PATCH_FILE}:${PLE_DISK_PY}:ro"
 )
-pass "the PLE queue-depth patch exists and mounts read-only once ple_patch_check accepts the image"
+pass "the PLE queue-depth patch exists and mounts read-only once patch_check accepts the image"
+
+(
+  unset_recipe
+  cd "${tmp}"
+  DRAFT_VOCAB=latin
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  validate_config
+  [[ -f "${DV_PATCH_FILE}" && -f "${DV_IDS_FILE}" ]]
+  grep -q 'VLLM_MTP_DRAFT_VOCAB' "${DV_PATCH_FILE}"
+  wanted_patches
+  [[ "${PLE_PATCH_ON}" == 1 && "${DV_PATCH_ON}" == 1 ]]
+  build_docker_cmd
+  has_pair -v "${DV_PATCH_FILE}:${MTP_PY}:ro"
+  has_pair -v "${DV_IDS_FILE}:${DV_IDS_MOUNT}:ro"
+  has_pair -e "VLLM_MTP_DRAFT_VOCAB=${DV_IDS_MOUNT}"
+  DRAFT_VOCAB=full
+  wanted_patches
+  [[ "${DV_PATCH_ON}" == 0 ]]
+  DRAFT_VOCAB=latin MTP_TOKENS=0
+  wanted_patches
+  [[ "${DV_PATCH_ON}" == 0 ]]
+)
+pass "the draft-vocabulary patch and id list mount read-only for DRAFT_VOCAB=latin, not for full or MTP_TOKENS=0"
 
 (
   unset_recipe
@@ -340,6 +366,7 @@ for bad in \
   'KV_CACHE_MEMORY_BYTES=30G' \
   'PRECISION=max' \
   'PLE_QUEUE_DEPTH=128' \
+  'DRAFT_VOCAB=small' \
   'B12X_W4A16_A4_PREFILL_TERMS=3' \
   'VLLM_B12X_DENSE_ACTIVATION_MODE=bf16' \
   'MEM_HARD_FLOOR_GIB=9' \
@@ -365,13 +392,14 @@ do
 done
 pass "validate_config rejects bad values"
 
-dry="$(DRY_RUN=1 "${ROOT}/start.sh")"
+dry="$(DRY_RUN=1 DRAFT_VOCAB=latin "${ROOT}/start.sh")"
 printf '%s\n' "${dry}" | grep -q '\[dry-run\]' || fail "DRY_RUN did not print a command"
 printf '%s\n' "${dry}" | grep -q 'VLLM_PLE_TABLE_MEMORY=disk' || fail "DRY_RUN dropped the PLE flag"
 printf '%s\n' "${dry}" | grep -q 'eugr/spark-vllm-b12x:latest' || fail "DRY_RUN dropped the image"
 printf '%s\n' "${dry}" | grep -q -- '--network' || fail "DRY_RUN dropped host networking"
 printf '%s\n' "${dry}" | grep -q -- '--gpus' || fail "DRY_RUN dropped --gpus"
 printf '%s\n' "${dry}" | grep -q 'ple_disk_qd256.py' || fail "DRY_RUN dropped the PLE queue-depth patch"
+printf '%s\n' "${dry}" | grep -q 'mtp_draft_vocab.py' || fail "DRY_RUN dropped the draft-vocabulary patch"
 pass "DRY_RUN=1 ./start.sh prints the docker command"
 
 echo "test_config: ${N} checks passed"

@@ -12,6 +12,15 @@ vLLM
   https://github.com/vllm-project/vllm
   Apache License, Version 2.0.
   The serve command is `vllm serve`. This repository does not vendor vLLM.
+  patches/mtp_draft_vocab.py is a modified copy of vllm/models/qwen4_exp/nvidia/mtp.py as shipped in the
+  eugr/spark-vllm-b12x image (sha256 c87aabf0...). The changes, noted at the top of the file, add the
+  VLLM_MTP_DRAFT_VOCAB option: the MTP draft head keeps only the listed rows of the LM head.
+
+qwen3.8-Flash-DGX (blazux)
+  https://github.com/blazux/qwen3.8-Flash-DGX
+  Apache License, Version 2.0.
+  The reduced MTP draft vocabulary is their idea. This repository reimplements it for this image and picks
+  its own token list (tools/build_draft_vocab.py); it does not copy their code.
 
 eugr/spark-vllm-b12x
   https://github.com/eugr/spark-vllm-docker

@@ -150,13 +150,22 @@ else
 fi
 
 if (( DRY == 0 )); then
-  ple_patch_check
-elif [[ "${PLE_QUEUE_DEPTH}" == 256 ]]; then
-  PLE_PATCH_ON=1
-  log "DRY_RUN: a real start checks that ${IMAGE} has the expected ${PLE_DISK_PY##*/} before mounting the patch"
+  patch_check
+else
+  wanted_patches
+  if (( PLE_PATCH_ON || DV_PATCH_ON )); then
+    log "DRY_RUN: a real start checks that ${IMAGE} has the expected files before mounting the patches"
+  fi
 fi
 if [[ "${PLE_PATCH_ON}" == 1 ]]; then
   log "PLE queue depth 256: ${PLE_PATCH_FILE##*/} mounted read-only"
+fi
+if [[ "${DV_PATCH_ON}" == 1 ]]; then
+  log "Draft vocabulary latin: ${DV_PATCH_FILE##*/} and ${DV_IDS_FILE##*/} mounted read-only"
+fi
+DRAFT_LINE="full"
+if [[ "${DV_PATCH_ON}" == 1 ]]; then
+  DRAFT_LINE="latin (147,840 of 248,320 tokens)"
 fi
 
 build_docker_cmd "$@"
@@ -268,6 +277,7 @@ cat <<EOF
   Checkpoint   ${MODEL_ID}
   Image        ${IMAGE}
   Window       ${MAX_MODEL_LEN} tokens · ${MAX_NUM_SEQS} at once · ${KV_CACHE_DTYPE} KV · MTP ${MTP_TOKENS}
+  Draft vocab  ${DRAFT_LINE}
   Profile      ${PROFILE_LINE}
   KV cache     ${KV_TOKENS:-see docker logs} tokens · pool ${KV_LINE}
   PLE table    ${VLLM_PLE_TABLE_MEMORY} (${B12X_DISK_BACKEND})
