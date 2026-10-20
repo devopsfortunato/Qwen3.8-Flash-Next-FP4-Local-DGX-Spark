@@ -103,11 +103,26 @@ export B12X_W4A16_A4_PREFILL="${B12X_W4A16_A4_PREFILL:-1}"
 # original: prefill about 4% faster, identical output. start.sh mounts it only when the image's file is the
 # one the patch was made from (PLE_DISK_SHA256); otherwise it warns and serves with 64. 64 mounts nothing.
 PLE_QUEUE_DEPTH="${PLE_QUEUE_DEPTH:-256}"
+PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/patches"
 PLE_DISK_PY="/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/sequence/ple_embedding/_disk.py"
 PLE_DISK_SHA256="2232d15d5034d9c0cfb9dc3bdbf0e3f49bcc619f51c9ccee77364a0553c6ddeb"
-PLE_PATCH_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/patches/ple_disk_qd256.py"
-# Set by ple_patch_check: 1 when the patch is mounted.
+PLE_PATCH_FILE="${PATCH_DIR}/ple_disk_qd256.py"
+# Tokens the MTP drafter may propose (README, Draft vocabulary). full (the default): all 248,320. latin: the
+# 147,840 written in Latin script, digits, symbols or byte pieces, plus every special token. Each draft step
+# then reads 40% less LM head: English, Italian and code decode about 3% faster. The model still checks every
+# drafted token, so the output is the same, but text in other scripts drafts far worse: Chinese decodes 52%
+# slower and Russian 37% slower. Opt in only when the traffic is in Latin script. latin mounts
+# patches/mtp_draft_vocab.py and the id list read-only, only when the image's mtp.py is the one the patch was
+# made from (MTP_PY_SHA256) and MTP_TOKENS > 0.
+DRAFT_VOCAB="${DRAFT_VOCAB:-full}"
+MTP_PY="/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/nvidia/mtp.py"
+MTP_PY_SHA256="c87aabf01195294eded4e966f67a0d46adf3a7fe2fc343901305214d014bbb3d"
+DV_PATCH_FILE="${PATCH_DIR}/mtp_draft_vocab.py"
+DV_IDS_FILE="${PATCH_DIR}/draft_vocab_latin.npy"
+DV_IDS_MOUNT="/opt/recipe/draft_vocab_latin.npy"
+# Set by patch_check: 1 when that patch is mounted.
 PLE_PATCH_ON=0
+DV_PATCH_ON=0
 # Activation precision (README, Precision). fast (the default): the model card's settings, one FP4 term for
 # prefill MoE activations and the dense format the autotuner picks for speed. quality: an FP4 residual term on
 # top, and BF16 activations in the dense NVFP4/MXFP8 layers; closer to full precision token by token, about 21%
@@ -340,19 +355,39 @@ validate_config() {
   if [[ ! "${PLE_QUEUE_DEPTH}" =~ ^(64|256)$ ]]; then
     die "PLE_QUEUE_DEPTH is 64 or 256, not ${PLE_QUEUE_DEPTH}"
   fi
+  if [[ ! "${DRAFT_VOCAB}" =~ ^(latin|full)$ ]]; then
+    die "DRAFT_VOCAB is latin or full, not ${DRAFT_VOCAB}"
+  fi
 }
 
-# PLE_PATCH_ON=1 when PLE_QUEUE_DEPTH is 256 and the image's _disk.py is the file the patch was made from.
-# Any other image keeps its own file: a patch made from different code could change the model.
-ple_patch_check() {
+# The patches each setting asks for: PLE_QUEUE_DEPTH=256, and DRAFT_VOCAB=latin while MTP drafts.
+wanted_patches() {
   PLE_PATCH_ON=0
-  [[ "${PLE_QUEUE_DEPTH}" == 256 ]] || return 0
-  local sum
-  sum="$(docker run --rm --entrypoint sha256sum "${IMAGE}" "${PLE_DISK_PY}" 2>/dev/null | cut -d ' ' -f 1)" || sum=""
-  if [[ "${sum}" == "${PLE_DISK_SHA256}" ]]; then
+  DV_PATCH_ON=0
+  if [[ "${PLE_QUEUE_DEPTH}" == 256 ]]; then
     PLE_PATCH_ON=1
-  else
-    warn "${IMAGE} has a different ${PLE_DISK_PY##*/} (sha256 ${sum:-unreadable}): PLE queue depth stays 64"
+  fi
+  if [[ "${DRAFT_VOCAB}" == latin ]] && (( MTP_TOKENS > 0 )); then
+    DV_PATCH_ON=1
+  fi
+}
+
+# Keep a wanted patch only when the image's file is the one the patch was made from. Any other image keeps
+# its own files: a patch made from different code could change the model.
+patch_check() {
+  wanted_patches
+  (( PLE_PATCH_ON || DV_PATCH_ON )) || return 0
+  local sums ple dv
+  sums="$(docker run --rm --entrypoint sha256sum "${IMAGE}" "${PLE_DISK_PY}" "${MTP_PY}" 2>/dev/null)" || true
+  ple="$(awk -v f="${PLE_DISK_PY}" '$2 == f { print $1 }' <<< "${sums}")"
+  dv="$(awk -v f="${MTP_PY}" '$2 == f { print $1 }' <<< "${sums}")"
+  if [[ "${PLE_PATCH_ON}" == 1 && "${ple}" != "${PLE_DISK_SHA256}" ]]; then
+    PLE_PATCH_ON=0
+    warn "${IMAGE} has a different ${PLE_DISK_PY##*/} (sha256 ${ple:-unreadable}): PLE queue depth stays 64"
+  fi
+  if [[ "${DV_PATCH_ON}" == 1 && "${dv}" != "${MTP_PY_SHA256}" ]]; then
+    DV_PATCH_ON=0
+    warn "${IMAGE} has a different ${MTP_PY##*/} (sha256 ${dv:-unreadable}): the drafter keeps the full vocabulary"
   fi
 }
 
@@ -394,6 +429,13 @@ build_docker_cmd() {
   fi
   if [[ "${PLE_PATCH_ON}" == 1 ]]; then
     DOCKER_CMD+=(-v "${PLE_PATCH_FILE}:${PLE_DISK_PY}:ro")
+  fi
+  if [[ "${DV_PATCH_ON}" == 1 ]]; then
+    DOCKER_CMD+=(
+      -v "${DV_PATCH_FILE}:${MTP_PY}:ro"
+      -v "${DV_IDS_FILE}:${DV_IDS_MOUNT}:ro"
+      -e "VLLM_MTP_DRAFT_VOCAB=${DV_IDS_MOUNT}"
+    )
   fi
   DOCKER_CMD+=(
     -e "HF_HOME=/root/.cache/huggingface"

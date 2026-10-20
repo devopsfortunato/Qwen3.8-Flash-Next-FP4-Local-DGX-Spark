@@ -149,6 +149,7 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | `VLLM_PLE_TABLE_MEMORY` | `disk` | n-gram table on disk, as on the model card |
 | `B12X_DISK_BACKEND` | `io_uring` | how that table is read |
 | `PLE_QUEUE_DEPTH` | `256` | table reads in flight; `256` mounts `patches/ple_disk_qd256.py`, `64` is the image as shipped (see [PLE queue depth](#ple-queue-depth)) |
+| `DRAFT_VOCAB` | `full` | tokens the MTP drafter may propose; `full` is the image as shipped, `latin` mounts `patches/mtp_draft_vocab.py` and its id list: 3% faster decode on Latin-script text, much slower on Chinese or Russian (see [Draft vocabulary](#draft-vocabulary)) |
 | `CUTE_DSL_ARCH` | `sm_121a` | GB10 architecture for the CuTe DSL kernels |
 | `HF_CACHE` | `~/.cache/huggingface` | where the checkpoint is stored |
 | `MEM_NEED_GIB` | `90` | `MemAvailable` `start.sh` asks for before launch |
@@ -295,6 +296,9 @@ Tried and left out:
   matters more to you.
 - **Kernel levers** (`B12X_W4A16_SMALL_M_OCCUPANCY=2`, `VLLM_B12X_BF16_GEMV=1`, `B12X_W4A16_A4_PREFILL_WARPS=16`,
   `--gdn-prefill-backend flashinfer`): within run-to-run noise, slower, less KV, or worse perplexity.
+- **Fewer drafts under load** (`num_speculative_tokens_per_batch_size`): with 1, 2, 4 and 8 requests decoding
+  together, MTP 2 and MTP 1 stay within 3% of MTP 3 in both directions (MTP 2 is 3% ahead at 4 requests and
+  3% behind at 2 and 8), so no batch-size schedule beats a fixed 3.
 
 ## PLE queue depth
 
@@ -320,6 +324,56 @@ The image has no setting for it, so `start.sh` mounts `patches/ple_disk_qd256.py
 file. It is the image's own file with that one number changed. Before mounting it, `start.sh` checks the
 image's file against the sha256 the patch was made from; with any other image it warns and serves with 64.
 `PLE_QUEUE_DEPTH=64` turns it off.
+
+## Draft vocabulary
+
+MTP drafts 3 tokens per decode step, and each draft scores the whole 248,320-token vocabulary with the
+drafter's own NVFP4 LM head: about 1.5 ms of a 60 ms step, three times. Most of those rows are scripts an
+English, Italian or code session never drafts: about 55k Chinese, 19k Cyrillic, 9k Arabic, 7k Korean and 6k
+Thai tokens. `DRAFT_VOCAB=latin`, opt-in, keeps the 147,840 tokens written in Latin script (ASCII and
+accented letters), Greek, digits, symbols or byte pieces, plus every special token (chat, thinking and
+tool-call markers). Every other token gets −∞ in the draft. One request, 512 greedy tokens, both measured in
+the same window:
+
+| | `DRAFT_VOCAB=full` (default) | `DRAFT_VOCAB=latin` |
+| --- | ---: | ---: |
+| English prose / code / mixed, ms per decode step | 59.8 / 60.0 / 60.5 | **58.1 / 58.3 / 58.8 (−3%)** |
+| English code / mixed | 53.9 / 43.5 t/s | **55.5 / 44.8 t/s (+3%)** |
+| Italian essay | 41.7 t/s | **42.9 t/s (+3%)** |
+| Russian essay | **41.0 t/s** | 25.9 t/s (−37%) |
+| Chinese essay | **44.5 t/s** | 21.3 t/s (−52%) |
+
+On Latin-script text the drafts are accepted as often as before (acceptance length 3.24 on code and 2.64 on
+mixed, both sides), so the gain is the cheaper draft step. In Chinese and Russian most tokens are not in the
+list, so the drafter cannot propose them: acceptance length falls from 2.65 to 1.27 on the Chinese essay. That
+is why `full` stays the default. Set `DRAFT_VOCAB=latin` when the traffic is English, Italian, other
+Latin-script languages or code. On llm_context_benchmarks, which samples and varies by ±1.5 t/s from run to
+run, decode was 45.5 against 45.7 t/s: a 3% change is below what that benchmark can resolve.
+
+The output is unchanged. The drafter only proposes tokens: the model checks every one and keeps a drafted
+token only when it is the one the model itself produces, so a smaller vocabulary can only change how many
+drafts are accepted. The checks:
+
+- Perplexity texts with `prompt_logprobs`: bit-identical to `full` on every window.
+- Greedy output on the three benchmark prompts: code and mixed are byte-identical to `full`. Prose matches
+  `full`'s text from two earlier runs: `full` itself alternates between prose texts from run to run, at a
+  point where four next words are within 0.9 nats of each other.
+- Each greedy text scored by the `full` server, token by token: latin's texts pick a token other than the
+  model's first choice as often as `full`'s own runs do (prose: 17 of 511 tokens, against 12 to 30 for `full`;
+  mixed: 22, against 22 to 30).
+- Coverage: the list holds 100% of the tokens in fresh model output in English, Italian, code, math and JSON.
+
+The image has no setting for it, so `start.sh` mounts `patches/mtp_draft_vocab.py` (the image's `mtp.py`
+plus a `VLLM_MTP_DRAFT_VOCAB` option) and `patches/draft_vocab_latin.npy` read-only. Before mounting them it
+checks the image's `mtp.py` against the sha256 the patch was made from; with any other image it warns and
+keeps the full vocabulary. The patch reads the kept rows of the LM head from the checkpoint, so the draft
+head is smaller: about 400 MiB more memory free while serving (median 7.5 GiB against 7.1 GiB).
+`tools/build_draft_vocab.py` rebuilds the list from the tokenizer. The idea comes from blazux's
+[qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX) recipe, which drafts from 65,536 tokens.
+
+Also tried: a 65,536-token list chosen by how often the model writes each token decodes English and code 6%
+faster than `full`, but Italian 3% slower, so it is not offered. MTP 4 with `latin` accepts more drafts (3.56
+against 3.24 tokens per step on code) but each step takes 64 ms against 58: slower than MTP 3.
 
 ## Benchmarks
 
@@ -551,7 +605,9 @@ scripts/config.sh        settings and build_docker_cmd
 scripts/prepare.sh       pull the image, download the checkpoint
 scripts/test_config.sh   config checks
 profiles/                opt-in launch profiles (kv-max, 1m)
-patches/                 ple_disk_qd256.py, mounted read-only for PLE_QUEUE_DEPTH=256
+patches/                 ple_disk_qd256.py (PLE_QUEUE_DEPTH=256); mtp_draft_vocab.py and
+                         draft_vocab_latin.npy (DRAFT_VOCAB=latin); mounted read-only
+tools/                   build_draft_vocab.py, rebuilds draft_vocab_latin.npy
 docs/                    benchmark charts
 .env.example             commented overrides
 CREDITS.md               what this builds on
