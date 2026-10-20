@@ -26,8 +26,9 @@ command: `VLLM_PLE_TABLE_MEMORY=disk` and a 262,144-token window.
 `./start.sh` prepares the machine on the first run and starts the server. `./stop.sh` stops it.
 
 > **Status:** tested on one DGX Spark (GB10, 121 GB unified memory). At a 128k prose context: prefill
-> 1,990 t/s, decode 39 t/s, TTFT 66 s (`PRECISION=quality`: 1,515 t/s, 38 t/s, 86 s). 1,365,333 tokens of
-> FP8 KV cache, five full 262k requests at once. sixcat 92.1, tool-eval 89/100. See [Benchmarks](#benchmarks).
+> 2,114 t/s, decode 39 t/s, TTFT 62 s (`PRECISION=quality`, measured before the PLE queue-depth change: 1,515
+> t/s, 38 t/s, 86 s). 1,575,180 tokens of FP8 KV cache: six full 262k requests at once, up to 8 decoded
+> together. sixcat 92.1, tool-eval 89/100. See [Benchmarks](#benchmarks).
 
 ## Quick start
 
@@ -97,8 +98,8 @@ docker logs -f qwen38-flash-next-fp4
    that lock and then exits without stopping anything.
 3. **Launch.** `docker run` with `--network host`, `--gpus all`, the model-card environment, and `vllm serve`.
 4. **Loading.** Wait until `/v1/models` answers. The container is stopped if `MemAvailable` stays below
-   `MEM_FLOOR_GIB` (8 GiB) for `MEM_FLOOR_GRACE` seconds (30), or falls below `MEM_HARD_FLOOR_GIB` (2 GiB).
-   Every load dips to about 4 GiB for up to 10 seconds while vLLM repacks the loaded weights; the grace
+   `MEM_FLOOR_GIB` (6 GiB) for `MEM_FLOOR_GRACE` seconds (30), or falls below `MEM_HARD_FLOOR_GIB` (2 GiB).
+   Every load dips to about 3-4 GiB for up to 10 seconds while vLLM repacks the loaded weights; the grace
    lets that pass.
 5. **Smoke test**, then the LIVE line.
 
@@ -130,10 +131,10 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | `PORT` / `HOST` | `8000` / `0.0.0.0` | where the API listens |
 | `SERVED_NAME` | the model id | id returned by `/v1/models` |
 | `MAX_MODEL_LEN` | `262144` | prompt + reply window (`--max-model-len`) |
-| `MAX_NUM_SEQS` | `5` | requests decoded together; five full windows fit the default KV pool |
+| `MAX_NUM_SEQS` | `8` | requests decoded together; the default KV pool holds six full windows, all 8 while they average under about 196k tokens |
 | `MAX_NUM_BATCHED_TOKENS` | `4096` | chunked-prefill token cap |
 | `GPU_MEMORY_UTILIZATION` | `0.8` | fraction of GPU memory vLLM may use; sizes the KV pool only when `KV_CACHE_MEMORY_BYTES` is empty |
-| `KV_CACHE_MEMORY_BYTES` | `27000000000` | KV pool in bytes (`--kv-cache-memory-bytes`): 1,365,333 FP8 tokens. Empty uses `GPU_MEMORY_UTILIZATION` |
+| `KV_CACHE_MEMORY_BYTES` | `31150000000` | KV pool in bytes (`--kv-cache-memory-bytes`): 1,575,180 FP8 tokens. Empty uses `GPU_MEMORY_UTILIZATION` |
 | `YARN_FACTOR` | empty | YaRN rope scaling past 262,144 positions; `4` allows a 1,048,576 window |
 | `PROFILE` | empty | opt-in launch profile from `profiles/` (see [Profiles](#profiles)) |
 | `PRECISION` | `fast` | activation precision; `fast` is the model card's, `quality` is closer to full precision (see [Precision](#precision)) |
@@ -147,10 +148,11 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | `DTYPE` | `bfloat16` | model dtype |
 | `VLLM_PLE_TABLE_MEMORY` | `disk` | n-gram table on disk, as on the model card |
 | `B12X_DISK_BACKEND` | `io_uring` | how that table is read |
+| `PLE_QUEUE_DEPTH` | `256` | table reads in flight; `256` mounts `patches/ple_disk_qd256.py`, `64` is the image as shipped (see [PLE queue depth](#ple-queue-depth)) |
 | `CUTE_DSL_ARCH` | `sm_121a` | GB10 architecture for the CuTe DSL kernels |
 | `HF_CACHE` | `~/.cache/huggingface` | where the checkpoint is stored |
 | `MEM_NEED_GIB` | `90` | `MemAvailable` `start.sh` asks for before launch |
-| `MEM_FLOOR_GIB` | `8` | stop the load if free memory stays below this for `MEM_FLOOR_GRACE` (30 s) |
+| `MEM_FLOOR_GIB` | `6` | stop the load if free memory stays below this for `MEM_FLOOR_GRACE` (30 s) |
 | `MEM_HARD_FLOOR_GIB` | `2` | stop the load at once below this |
 | `MIN_FREE_GB` | `120` | disk `prepare.sh` asks for when the snapshot is absent |
 | `IMAGE_FREE_GB` | `30` | disk asked for when the image is not local |
@@ -182,15 +184,31 @@ read as data, and `.env` and the environment still win over it. The default need
 
 | Profile | Window | KV pool | FP8 KV tokens | Full windows at once | Notes |
 | --- | ---: | --- | ---: | ---: | --- |
-| none | 262,144 | 27 GB | 1,365,333 | 5.2 | the default; cap 5; lowest `MemAvailable` while serving 11.4 GiB |
+| none | 262,144 | 31.15 GB | 1,575,180 | 6.0 | the default; cap 8; lowest `MemAvailable` while serving 6.9 GiB; floor 6 GiB |
 | `kv-max` | 262,144 | 34 GB | 1,719,161 | 6.6 | cap 6; lowest `MemAvailable` while serving 4.4 GiB; floor 4 GiB |
 | `1m` | 1,048,576 | 30 GB | 1,931,132 | 1.8 | test profile: YaRN 4x, floor 4 GiB |
 
-The default pool is pinned at 27 GB, so five full 262,144-token requests decode at once, and the request cap is
-5 to match: every running request has room to reach the full window, and a sixth waits for a free slot. The
-pool used to be sized at 0.8 of memory (1.05-1.10M tokens, 4 full windows, drifting by about 0.7 GiB between
-boots) with a cap of 8. An empty `KV_CACHE_MEMORY_BYTES=` brings that sizing back, and `MAX_NUM_SEQS=8` the old
-cap. Checks on the 27 GB pool, still with the cap of 8:
+The default pool is pinned at 31.15 GB: 1,575,180 FP8 tokens, six full 262,144-token requests at once. Up to 8
+requests decode together, and all 8 fit while they average under about 196k tokens each. Past that vLLM pauses
+one request and recomputes it once there is room: slower, never wrong. A ninth request waits for a free slot.
+`KV_CACHE_MEMORY_BYTES=27000000000 MAX_NUM_SEQS=5` brings back the previous default (1,365,333 tokens, cap 5),
+and an empty `KV_CACHE_MEMORY_BYTES=` the older sizing at 0.8 of memory (1.05-1.10M tokens, drifting by about
+0.7 GiB between boots).
+
+Checks on the 31.15 GB pool with the cap of 8:
+
+- Six prompts of 252,700-253,222 tokens, each generating 3,000 tokens, decoded together with no preemption; KV
+  use peaked at 89%. vLLM reads one prompt at a time, so the sixth got its first token after 790 s.
+- Eight 30k-token prompts sent at once: all 8 answered, first tokens after 71 s (median) and 120 s (last).
+- Every token's logprob on the perplexity texts is identical to the 27 GB pool (fresh text 2.2049, all text
+  1.0902): the pool size changes no answer.
+- Lowest `MemAvailable` while serving 6.9 GiB, against about 12 GiB with 27 GB. Once the pool is allocated the
+  loading server sits near 7 GiB, so `MEM_FLOOR_GIB` is 6 (it was 8).
+- The cap of 8 against 5 (on the 27 GB pool): 8 users with 1k prompts get 111 t/s combined against 78 (+43%),
+  and the last first token arrives after 4.4 s instead of 32 s. With 1 or 5 users both caps give the same
+  speed (36 and 84-86 t/s). Each request decodes a bit slower when 8 share the GPU: 16 t/s against 19.
+
+Earlier checks on the 27 GB pool with the cap of 8:
 
 - Five prompts of 246,388-253,222 tokens, each generating 3,000 tokens, decoded together with no preemption.
   vLLM reads one prompt at a time, so the fifth got its first token after 652 s. Lowest `MemAvailable` 12.4 GiB.
@@ -200,7 +218,7 @@ cap. Checks on the 27 GB pool, still with the cap of 8:
   92.2). sixcat sends 4 requests at once, so long answers differ between any two runs; one config swings as
   much as the two differ (tools by 10 points, instruct by 5).
 
-Checks on the cap of 5, same pool:
+Earlier checks on the cap of 5, same 27 GB pool:
 
 - Up to 5 requests nothing changes. With 8 or 16 the extra requests wait for a slot, so total output drops:
   51 t/s against 63 with 8k prompts (-19%), 23 against 25 with 32k prompts (-8%), and the slowest of 16 8k
@@ -278,6 +296,31 @@ Tried and left out:
 - **Kernel levers** (`B12X_W4A16_SMALL_M_OCCUPANCY=2`, `VLLM_B12X_BF16_GEMV=1`, `B12X_W4A16_A4_PREFILL_WARPS=16`,
   `--gdn-prefill-backend flashinfer`): within run-to-run noise, slower, less KV, or worse perplexity.
 
+## PLE queue depth
+
+The model's n-gram embedding table (26.9 GiB) stays on NVMe, and every prefill chunk reads its rows with
+io_uring. The image keeps at most 64 reads in flight (a fixed default in FlashInfer's `ple_embedding/_disk.py`),
+and the GPU waits about 120 ms per 4,096-token chunk for them. `PLE_QUEUE_DEPTH=256`, the default, keeps 256
+in flight:
+
+| | Prefill, 8k/16k/32k prompts | Decode |
+| --- | ---: | ---: |
+| `PLE_QUEUE_DEPTH=64`, the image as shipped | 2,307 t/s | 45.0 t/s |
+| `PLE_QUEUE_DEPTH=256` | **2,404 t/s (+4.2%)** | 45.4 t/s |
+
+On llm_context_benchmarks (prose and code at 0.5k, 8k, 32k and 128k, one request at a time), the new defaults
+against the old ones: prefill 1,801 t/s against 1,724 (geometric mean, +4.5%), and 2,114 against 1,992 t/s at a
+128k prose context (+6.1%), so its first token comes after 61.6 s instead of 65.4 s. Decode is unchanged within
+noise (45.7 against 45.0 t/s).
+
+The output is bit-identical: every token's logprob on the perplexity texts (prose, code, fresh 2026 texts and
+a 96k-token book) matches the 64 run exactly. The same rows are read; only how many at once changes.
+
+The image has no setting for it, so `start.sh` mounts `patches/ple_disk_qd256.py` read-only over the image's
+file. It is the image's own file with that one number changed. Before mounting it, `start.sh` checks the
+image's file against the sha256 the patch was made from; with any other image it warns and serves with 64.
+`PLE_QUEUE_DEPTH=64` turns it off.
+
 ## Benchmarks
 
 Four ways to serve the same model, on the same Spark, back to back. Each runs on its own defaults, with a
@@ -316,8 +359,9 @@ What the numbers say:
 - **hibrid48 and TensorFold are faster.** hibrid48 decodes 19% faster than `fast` (54.3 against 45.8 t/s,
   geometric means) and prefills 13% faster, with MTP up to 7 and Marlin kernels. TensorFold is second (51.6 t/s,
   1,858 t/s) and the fastest of all on short code (67.9 t/s at 0.5k). All four stay above 38 t/s at 128k.
-- **No recipe serves the most requests at every length.** This recipe holds 1,365,333 tokens of FP8 KV in its
-  27 GB default pool with a cap of 5: 5 requests at any length up to the full 262k window. hibrid48 keeps BF16
+- **No recipe serves the most requests at every length.** This recipe ran with its earlier default, 1,365,333
+  tokens of FP8 KV in a 27 GB pool with a cap of 5: 5 requests at any length up to the full 262k window. The
+  default is now 1,575,180 tokens with a cap of 8: 6 full windows, or 8 requests averaging up to 196k. hibrid48 keeps BF16
   KV, 877k tokens, with a cap of 16: the most requests up to 128k, 3 full windows. TensorFold takes all memory
   but 10 GiB, about 1.57M tokens, with a cap of 5: all 5 at full windows. `PROFILE=kv-max` gives this recipe
   the largest pool, 1.72M tokens, and a cap of 6: 6 full windows.
@@ -507,6 +551,7 @@ scripts/config.sh        settings and build_docker_cmd
 scripts/prepare.sh       pull the image, download the checkpoint
 scripts/test_config.sh   config checks
 profiles/                opt-in launch profiles (kv-max, 1m)
+patches/                 ple_disk_qd256.py, mounted read-only for PLE_QUEUE_DEPTH=256
 docs/                    benchmark charts
 .env.example             commented overrides
 CREDITS.md               what this builds on

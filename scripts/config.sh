@@ -53,15 +53,17 @@ QUANTIZATION="${QUANTIZATION:-modelopt_mixed}"
 LOAD_FORMAT="${LOAD_FORMAT:-b12x}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
-# Requests decoded at once. 5 matches the default KV pool, which holds five full 262,144-token requests, so
-# every running request has room to reach the full window. Requests past the cap wait for a free slot.
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-5}"
+# Requests decoded at once. 8 users with 1k prompts get 111 t/s combined against 78 with a cap of 5, and the
+# last first token comes after 4.4 s instead of 32 s. All 8 fit in the pool while they average under about
+# 196k tokens each; past that vLLM pauses one and recomputes it later (slower, never wrong).
+# Requests past the cap wait for a free slot.
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
-# Bytes for the KV cache (--kv-cache-memory-bytes). 27 GB holds about 1.36M FP8 tokens: five full
-# 262,144-token requests at once, with 11.4 GiB or more of memory left free while serving. Set it empty
+# Bytes for the KV cache (--kv-cache-memory-bytes). 31.15 GB holds 1,575,180 FP8 tokens: six full
+# 262,144-token requests at once, with 6.9 GiB or more of memory left free while serving. Set it empty
 # (KV_CACHE_MEMORY_BYTES=) for the GPU_MEMORY_UTILIZATION sizing, which drifts by about 0.7 GiB between boots.
-KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES-27000000000}"
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES-31150000000}"
 # YaRN rope scaling for windows past the checkpoint's 262,144 positions (NATIVE_MAX_LEN).
 # Empty or 1 leaves rope alone. 4 allows MAX_MODEL_LEN up to 1,048,576.
 YARN_FACTOR="${YARN_FACTOR:-}"
@@ -96,6 +98,16 @@ export VLLM_MXFP8_LM_HEAD="${VLLM_MXFP8_LM_HEAD:-1}"
 export VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE="${VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE:-w13}"
 export VLLM_B12X_MOE_FP4_FORCE_A16="${VLLM_B12X_MOE_FP4_FORCE_A16:-1}"
 export B12X_W4A16_A4_PREFILL="${B12X_W4A16_A4_PREFILL:-1}"
+# Reads in flight for the PLE n-gram table on NVMe (README, PLE queue depth). The image hard-codes 64. 256
+# mounts patches/ple_disk_qd256.py, the image's own file with only that number changed, read-only over the
+# original: prefill about 4% faster, identical output. start.sh mounts it only when the image's file is the
+# one the patch was made from (PLE_DISK_SHA256); otherwise it warns and serves with 64. 64 mounts nothing.
+PLE_QUEUE_DEPTH="${PLE_QUEUE_DEPTH:-256}"
+PLE_DISK_PY="/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/sequence/ple_embedding/_disk.py"
+PLE_DISK_SHA256="2232d15d5034d9c0cfb9dc3bdbf0e3f49bcc619f51c9ccee77364a0553c6ddeb"
+PLE_PATCH_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/patches/ple_disk_qd256.py"
+# Set by ple_patch_check: 1 when the patch is mounted.
+PLE_PATCH_ON=0
 # Activation precision (README, Precision). fast (the default): the model card's settings, one FP4 term for
 # prefill MoE activations and the dense format the autotuner picks for speed. quality: an FP4 residual term on
 # top, and BF16 activations in the dense NVFP4/MXFP8 layers; closer to full precision token by token, about 21%
@@ -151,8 +163,9 @@ IMAGE_FREE_GB="${IMAGE_FREE_GB:-30}"
 MEM_NEED_GIB="${MEM_NEED_GIB:-90}"
 # While weights load, start.sh stops the container if MemAvailable stays below MEM_FLOOR_GIB for
 # MEM_FLOOR_GRACE seconds, or falls below MEM_HARD_FLOOR_GIB at all. The grace covers the dip of a few
-# seconds to about 4 GiB that every load goes through while vLLM repacks the loaded weights.
-MEM_FLOOR_GIB="${MEM_FLOOR_GIB:-8}"
+# seconds to about 3-4 GiB that every load goes through while vLLM repacks the loaded weights. With the
+# default pool allocated the server sits near 7 GiB, so the floor is 6.
+MEM_FLOOR_GIB="${MEM_FLOOR_GIB:-6}"
 MEM_FLOOR_GRACE="${MEM_FLOOR_GRACE:-30}"
 MEM_HARD_FLOOR_GIB="${MEM_HARD_FLOOR_GIB:-2}"
 MEM_CHECK="${MEM_CHECK:-1}"
@@ -324,6 +337,23 @@ validate_config() {
   if ! is_uint "${WAIT_TIMEOUT}" || (( WAIT_TIMEOUT < 1 )); then
     die "WAIT_TIMEOUT is seconds, not ${WAIT_TIMEOUT}"
   fi
+  if [[ ! "${PLE_QUEUE_DEPTH}" =~ ^(64|256)$ ]]; then
+    die "PLE_QUEUE_DEPTH is 64 or 256, not ${PLE_QUEUE_DEPTH}"
+  fi
+}
+
+# PLE_PATCH_ON=1 when PLE_QUEUE_DEPTH is 256 and the image's _disk.py is the file the patch was made from.
+# Any other image keeps its own file: a patch made from different code could change the model.
+ple_patch_check() {
+  PLE_PATCH_ON=0
+  [[ "${PLE_QUEUE_DEPTH}" == 256 ]] || return 0
+  local sum
+  sum="$(docker run --rm --entrypoint sha256sum "${IMAGE}" "${PLE_DISK_PY}" 2>/dev/null | cut -d ' ' -f 1)" || sum=""
+  if [[ "${sum}" == "${PLE_DISK_SHA256}" ]]; then
+    PLE_PATCH_ON=1
+  else
+    warn "${IMAGE} has a different ${PLE_DISK_PY##*/} (sha256 ${sum:-unreadable}): PLE queue depth stays 64"
+  fi
 }
 
 # --hf-overrides for YaRN. vLLM replaces rope_parameters as a whole, so every key of the checkpoint's
@@ -361,6 +391,9 @@ build_docker_cmd() {
   done
   if [[ -n "${HF_TOKEN:-}" ]]; then
     DOCKER_CMD+=(-e HF_TOKEN)
+  fi
+  if [[ "${PLE_PATCH_ON}" == 1 ]]; then
+    DOCKER_CMD+=(-v "${PLE_PATCH_FILE}:${PLE_DISK_PY}:ro")
   fi
   DOCKER_CMD+=(
     -e "HF_HOME=/root/.cache/huggingface"
