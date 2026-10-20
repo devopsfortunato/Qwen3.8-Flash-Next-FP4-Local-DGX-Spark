@@ -13,7 +13,7 @@ pass() { N=$((N + 1)); printf 'ok  %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1" >&2; exit 1; }
 
 unset_recipe() {
-  unset MODEL_ID MODEL_REVISION IMAGE CONTAINER_NAME SERVED_NAME HOST PORT TP_SIZE PP_SIZE \
+  unset MODEL_ID MODEL_REVISION IMAGE BASE_IMAGE CONTAINER_NAME SERVED_NAME HOST PORT TP_SIZE PP_SIZE \
     DTYPE KV_CACHE_DTYPE QUANTIZATION LOAD_FORMAT BLOCK_SIZE MAX_MODEL_LEN MAX_NUM_SEQS \
     MAX_NUM_BATCHED_TOKENS GPU_MEMORY_UTILIZATION MTP_TOKENS MAMBA_CACHE_MODE \
     GDN_DECODE_KERNEL LINEAR_BACKEND MOE_BACKEND MM_ENCODER_TP_MODE REASONING_PARSER \
@@ -50,7 +50,9 @@ has_word() {
 
 check_defaults() {
   [[ "${MODEL_ID}" == "nvidia/Qwen3.8-Flash-Next-FP4-Local" ]] || return 1
-  [[ "${IMAGE}" == "eugr/spark-vllm-b12x:latest" ]] || return 1
+  [[ "${BASE_IMAGE}" == "eugr/spark-vllm-b12x@sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595" ]] || return 1
+  [[ "${IMAGE}" =~ ^qwen38-flash-next-fp4:[0-9a-f]{12}$ && "${IMAGE}" == "${RECIPE_IMAGE}" ]] || return 1
+  is_recipe_image || return 1
   [[ "${PORT}" == "8000" ]] || return 1
   [[ "${HOST}" == "0.0.0.0" ]] || return 1
   [[ "${SERVED_NAME}" == "${MODEL_ID}" ]] || return 1
@@ -61,7 +63,7 @@ check_defaults() {
   [[ -z "${PROFILE}" && "${KV_CACHE_MEMORY_BYTES}" == "31150000000" && -z "${YARN_FACTOR}" ]] || return 1
   [[ "${MAX_MODEL_LEN}" == "262144" ]] || return 1
   [[ "${MAX_NUM_SEQS}" == "8" ]] || return 1
-  [[ "${PLE_QUEUE_DEPTH}" == "256" && "${PLE_PATCH_ON}" == 0 ]] || return 1
+  [[ "${PLE_QUEUE_DEPTH}" == "256" ]] || return 1
   [[ "${GPU_MEMORY_UTILIZATION}" == "0.8" ]] || return 1
   [[ "${VLLM_PLE_TABLE_MEMORY}" == "disk" ]] || return 1
   [[ "${B12X_DISK_BACKEND}" == "io_uring" ]] || return 1
@@ -120,14 +122,14 @@ check_cmd() {
   has_word "B12X_W4A16_A4_PREFILL=1" || return 1
   has_word "B12X_W4A16_A4_PREFILL_TERMS=1" || return 1
   has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=auto" || return 1
+  has_word "PLE_QUEUE_DEPTH=256" || return 1
   has_word "--speculative-config" || return 1
   has_word '{"method":"mtp","num_speculative_tokens":3}' || return 1
   has_pair --kv-cache-memory-bytes 31150000000 || return 1
   has_word --hf-overrides && return 1
   has_word '{"pass_config":{"fuse_act_quant":true}}' || return 1
-  has_word "eugr/spark-vllm-b12x:latest" || return 1
+  has_word "${RECIPE_IMAGE}" || return 1
   printf '%s\n' "${DOCKER_CMD[@]}" | grep -q 'secret-token' && return 1
-  printf '%s\n' "${DOCKER_CMD[@]}" | grep -q '_disk.py:ro' && return 1
   return 0
 }
 
@@ -206,14 +208,21 @@ pass "an empty KV_CACHE_MEMORY_BYTES keeps the utilization sizing"
   cd "${tmp}"
   # shellcheck source=scripts/config.sh
   source "${CONFIG}"
-  validate_config
-  [[ -f "${PLE_PATCH_FILE}" ]]
-  grep -q 'queue_depth: int = 256' "${PLE_PATCH_FILE}"
-  PLE_PATCH_ON=1
-  build_docker_cmd
-  has_pair -v "${PLE_PATCH_FILE}:${PLE_DISK_PY}:ro"
+  first="${RECIPE_IMAGE}"
+  unset_recipe
+  BASE_IMAGE=eugr/spark-vllm-b12x@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  export BASE_IMAGE
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  [[ "${RECIPE_IMAGE}" != "${first}" && "${IMAGE}" == "${RECIPE_IMAGE}" ]]
+  unset_recipe
+  IMAGE=eugr/spark-vllm-b12x:latest
+  export IMAGE
+  # shellcheck source=scripts/config.sh
+  source "${CONFIG}"
+  ! is_recipe_image
 )
-pass "the PLE queue-depth patch exists and mounts read-only once ple_patch_check accepts the image"
+pass "the recipe image tag follows BASE_IMAGE, and another IMAGE is not the recipe image"
 
 (
   unset_recipe
@@ -368,10 +377,10 @@ pass "validate_config rejects bad values"
 dry="$(DRY_RUN=1 "${ROOT}/start.sh")"
 printf '%s\n' "${dry}" | grep -q '\[dry-run\]' || fail "DRY_RUN did not print a command"
 printf '%s\n' "${dry}" | grep -q 'VLLM_PLE_TABLE_MEMORY=disk' || fail "DRY_RUN dropped the PLE flag"
-printf '%s\n' "${dry}" | grep -q 'eugr/spark-vllm-b12x:latest' || fail "DRY_RUN dropped the image"
+printf '%s\n' "${dry}" | grep -qE 'qwen38-flash-next-fp4:[0-9a-f]{12} serve' || fail "DRY_RUN dropped the recipe image"
 printf '%s\n' "${dry}" | grep -q -- '--network' || fail "DRY_RUN dropped host networking"
 printf '%s\n' "${dry}" | grep -q -- '--gpus' || fail "DRY_RUN dropped --gpus"
-printf '%s\n' "${dry}" | grep -q 'ple_disk_qd256.py' || fail "DRY_RUN dropped the PLE queue-depth patch"
+printf '%s\n' "${dry}" | grep -q 'PLE_QUEUE_DEPTH=256' || fail "DRY_RUN dropped the PLE queue depth"
 pass "DRY_RUN=1 ./start.sh prints the docker command"
 
 echo "test_config: ${N} checks passed"
