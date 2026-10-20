@@ -123,6 +123,10 @@ if (( DRY )); then
   fi
 elif [[ "${MODE}" == restart ]] && running; then
   stop_container
+elif docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
+  # A container stopped by a failed load (memory floor, crash) keeps the name and docker run would refuse it.
+  docker rm -f "${CONTAINER_NAME}" >/dev/null
+  log "Removed the stopped container ${CONTAINER_NAME} left by an earlier run"
 fi
 
 if port_listening; then
