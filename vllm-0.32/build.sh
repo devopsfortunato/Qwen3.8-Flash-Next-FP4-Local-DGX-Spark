@@ -38,8 +38,8 @@ if (( $# < 2 )); then
   exit 1
 fi
 
-spark_docker="$1"
-vllm_src="$2"
+spark_docker="$(cd "$1" 2>/dev/null && pwd)" || { echo "error: no directory $1" >&2; exit 1; }
+vllm_src="$(cd "$2" 2>/dev/null && pwd)" || vllm_src="$2"
 shift 2
 
 if [[ ! -x "${spark_docker}/build-and-copy.sh" ]]; then
@@ -86,4 +86,7 @@ echo "spark-vllm-docker: ${spark_docker} @ ${spark_head}"
 echo "image tag   : ${tag}"
 echo
 
-exec "${spark_docker}/build-and-copy.sh" --vllm-source-dir "${vllm_src}" -t "${tag}" "$@"
+# build-and-copy.sh resolves its own helpers (docker/validate_flashinfer_wheels.py, ...) relative to the
+# current directory, so it has to run from the spark-vllm-docker checkout.
+cd "${spark_docker}"
+exec ./build-and-copy.sh --vllm-source-dir "${vllm_src}" -t "${tag}" "$@"
