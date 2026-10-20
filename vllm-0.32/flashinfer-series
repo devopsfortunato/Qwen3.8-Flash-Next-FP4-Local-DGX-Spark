@@ -1,0 +1,28 @@
+# FlashInfer side of the v0.32 lane (not vendored here)
+#
+# The runner needs two FlashInfer capabilities stock releases do not have:
+#
+#   01-pr5863.patch  canonical NVFP4 W4A4 MoE for SM12x
+#                    (flashinfer-ai/flashinfer#5863; merged upstream only on
+#                    2026-10-16, after the flashinfer-python 0.7.0.post1 that
+#                    vLLM v0.32.0 pins in requirements/cuda.txt)
+#   02-pr5943.patch  SM12x CuTe DSL MXFP8 GEMMs (flashinfer-ai/flashinfer#5943,
+#                    still open upstream; patch carries head 15c5c8d2)
+#
+# Source of truth: the pinned spark-vllm-docker checkout
+# docker/patches/qwen3.8/flashinfer/series (commit eadf57d), which applies both
+# patches. Validation base recorded there: FlashInfer
+# b77de25d433ff5082247b8e306c3aa54857e3ed7 (2026-10-12).
+#
+# How the build gets them: build-and-copy.sh's regular lane installs eugr's
+# prebuilt FlashInfer wheels (GitHub release prebuilt-flashinfer-current,
+# arch 12.1a), which are built from upstream main plus this series. Only an
+# explicit --rebuild-flashinfer (default ref main) or --flashinfer-ref build
+# recompiles them locally; note that --vllm-source-dir alone does not apply
+# the flashinfer series to a local FlashInfer build — the prebuilt wheels are
+# the validated path for this recipe. The runner stage installs the FlashInfer
+# wheels together with vLLM's under a pip --override file, so v0.32.0's
+# flashinfer-python==0.7.0.post1 pin does not force a downgrade.
+#
+# CUTE_DSL_ARCH=sm_121a (kept in profiles/vllm-0.32.env) is the compile target
+# #5943's CuTe DSL MXFP8 pool reads at runtime.

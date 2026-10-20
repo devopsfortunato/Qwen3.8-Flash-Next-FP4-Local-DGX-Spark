@@ -1,0 +1,16 @@
+01-pr59958.patch # qwen38 branch commit ed9f5b803c829e7d3078fc19d767ec90d60514a1
+02-pr59973.patch # qwen38 branch commit e24fee6f6c11ef50f135b3d6b692b72896da178e
+03-pr59740-60226.patch # qwen38 branch commit d2905ad76ebd57e0b945141c9fef42341a2d565d
+04-pr60068.patch # qwen38 branch commit 37fc6946ba30cfbad1f4011a22e3b38f8ff739f8
+05-pr54912.patch # qwen38 branch commit 2df1adcb778ad99f3dcb06de3aad739eb452f7e5
+06-pr50897.patch # qwen38 branch commit 2e94dcd9bc64d02cd9805cb7e1245231279740c1
+07-pr54614.patch # qwen38 branch commit a9ad3e5658454fbac00f75eec2574d83b3f95280
+08-pr54617.patch # qwen38 branch commit babb6449f3e2f97596dc042c6b4929e3c3b22649
+09-pr60252.patch # qwen38 branch commit fbb15e223710a63c78a7721539af0866090539ec
+10-pr59021.patch # qwen38 branch commit 5aee26960c7fb1d8c832cf9977347e5b52e31458
+11-pr59025.patch # qwen38 branch commit a0bff86337f8d0fbca834bb517145891d92e31a9
+13-draft-vocab.patch # qwen38 branch commit c2542b9b5cccafdd751ed44fae0deba60fcb3b4c
+14-pr60646.patch # qwen38 branch commit 705de4f49371f72dff6315f44a40fc53d1c93c81
+15-package-draft-vocab.patch # qwen38 branch commit 4ed49b1c7bf6a8d6ccf150c83eec66faac2547d7
+16-flash-next-fp4.patch # qwen38 branch commit df73eaf7b8407f7e2c98ae67eaf46ae8a34dd4ac
+17-flash-next-b12x-loader.patch # qwen38 branch commit aeda1aaed97523f3617744df41ee4b7c2bbf4b58

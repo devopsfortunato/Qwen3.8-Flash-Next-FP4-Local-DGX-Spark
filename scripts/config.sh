@@ -79,7 +79,10 @@ NATIVE_MAX_LEN="${NATIVE_MAX_LEN:-262144}"
 # and leaves 4-9% more KV cache (README, Benchmarks).
 MTP_TOKENS="${MTP_TOKENS:-3}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
-GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL:-b12x}"
+# Fork-only flag. A profile sets it empty to drop --gdn-decode-kernel entirely
+# (upstream vLLM v0.32.0 has no such flag; see profiles/vllm-0.32.env). The
+# default b12x keeps the pinned-image recipe unchanged.
+GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL-b12x}"
 LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
 MOE_BACKEND="${MOE_BACKEND:-b12x}"
 MM_ENCODER_TP_MODE="${MM_ENCODER_TP_MODE:-data}"
@@ -88,6 +91,15 @@ TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_xml}"
 if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
   COMPILATION_CONFIG='{"pass_config":{"fuse_act_quant":true}}'
 fi
+# Engram configuration passed as --engram-config (JSON object). Empty omits the
+# flag. The v0.32 profile sets {"host_file_gather":true} to keep the PLE n-gram
+# tables off the GPU; the fork lane reaches the same effect with
+# VLLM_PLE_TABLE_MEMORY, which upstream vLLM does not have.
+ENGRAM_CONFIG="${ENGRAM_CONFIG-}"
+# Space-separated SPARK_ENV names a profile removes from the container
+# environment (fork-only variables the upstream image does not know). Empty
+# keeps every default variable.
+SPARK_ENV_OMIT="${SPARK_ENV_OMIT-}"
 SHM_SIZE="${SHM_SIZE:-16g}"
 
 # Runtime environment from the model card's DGX Spark section.
@@ -148,6 +160,25 @@ SPARK_ENV=(
 
 # More container environment, as space-separated NAME=value pairs: EXTRA_ENV="B12X_FOO=1 B12X_BAR=2".
 EXTRA_ENV="${EXTRA_ENV:-}"
+
+# Remove the SPARK_ENV names a profile listed in SPARK_ENV_OMIT (fork-only
+# variables that the upstream v0.32 image must not receive).
+apply_spark_env_omit() {
+  local -a omit=() kept=()
+  read -r -a omit <<< "${SPARK_ENV_OMIT}" || true
+  if (( ${#omit[@]} > 0 )); then
+    local name o drop
+    for name in "${SPARK_ENV[@]}"; do
+      drop=0
+      for o in "${omit[@]}"; do
+        [[ "${name}" == "${o}" ]] && drop=1
+      done
+      (( drop )) || kept+=("${name}")
+    done
+    SPARK_ENV=("${kept[@]}")
+  fi
+}
+apply_spark_env_omit
 
 HF_CACHE="${HF_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}}"
 VLLM_CACHE="${VLLM_CACHE:-${HOME}/.cache/vllm}"
@@ -306,6 +337,9 @@ validate_config() {
   if [[ -z "${VLLM_PLE_TABLE_MEMORY}" ]]; then
     die "VLLM_PLE_TABLE_MEMORY is empty"
   fi
+  if [[ -n "${ENGRAM_CONFIG}" && ! "${ENGRAM_CONFIG}" =~ ^\{.*\}$ ]]; then
+    die "ENGRAM_CONFIG is a JSON object like {\"host_file_gather\":true}, not ${ENGRAM_CONFIG}"
+  fi
   if [[ ! "${PREPARE}" =~ ^(auto|0|1)$ ]]; then
     die "PREPARE is auto, 0, or 1, not ${PREPARE}"
   fi
@@ -418,8 +452,13 @@ build_docker_cmd() {
   if (( MTP_TOKENS > 0 )); then
     DOCKER_CMD+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS}}")
   fi
+  if [[ -n "${GDN_DECODE_KERNEL}" ]]; then
+    DOCKER_CMD+=(--gdn-decode-kernel "${GDN_DECODE_KERNEL}")
+  fi
+  if [[ -n "${ENGRAM_CONFIG}" ]]; then
+    DOCKER_CMD+=(--engram-config "${ENGRAM_CONFIG}")
+  fi
   DOCKER_CMD+=(
-    --gdn-decode-kernel "${GDN_DECODE_KERNEL}"
     --linear-backend "${LINEAR_BACKEND}"
     --moe-backend "${MOE_BACKEND}"
     --no-enable-flashinfer-autotune
