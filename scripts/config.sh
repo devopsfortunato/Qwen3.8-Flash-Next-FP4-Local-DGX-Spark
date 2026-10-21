@@ -79,7 +79,10 @@ NATIVE_MAX_LEN="${NATIVE_MAX_LEN:-262144}"
 # and leaves 4-9% more KV cache (README, Benchmarks).
 MTP_TOKENS="${MTP_TOKENS:-3}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
-GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL:-b12x}"
+# Fork-only flag. A profile sets it empty to drop --gdn-decode-kernel entirely
+# (upstream vLLM v0.32.0 has no such flag; see profiles/vllm-0.32.env). The
+# default b12x keeps the pinned-image recipe unchanged.
+GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL-b12x}"
 LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
 MOE_BACKEND="${MOE_BACKEND:-b12x}"
 MM_ENCODER_TP_MODE="${MM_ENCODER_TP_MODE:-data}"
@@ -88,6 +91,15 @@ TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_xml}"
 if [[ -z "${COMPILATION_CONFIG:-}" ]]; then
   COMPILATION_CONFIG='{"pass_config":{"fuse_act_quant":true}}'
 fi
+# Engram configuration passed as --engram-config (JSON object). Empty omits the
+# flag. The v0.32 profile sets {"host_file_gather":true} to keep the PLE n-gram
+# tables off the GPU; the fork lane reaches the same effect with
+# VLLM_PLE_TABLE_MEMORY, which upstream vLLM does not have.
+ENGRAM_CONFIG="${ENGRAM_CONFIG-}"
+# Space-separated SPARK_ENV names a profile removes from the container
+# environment (fork-only variables the upstream image does not know). Empty
+# keeps every default variable.
+SPARK_ENV_OMIT="${SPARK_ENV_OMIT-}"
 SHM_SIZE="${SHM_SIZE:-16g}"
 
 # Runtime environment from the model card's DGX Spark section.
@@ -109,18 +121,6 @@ export B12X_W4A16_A4_PREFILL="${B12X_W4A16_A4_PREFILL:-1}"
 # the recipe image reads this variable instead (docker/ple_queue_depth.py). 256: prefill about 4% faster,
 # identical output. Other images ignore it.
 PLE_QUEUE_DEPTH="${PLE_QUEUE_DEPTH:-256}"
-# Activation precision (README, Precision). fast (the default): the model card's settings, one FP4 term for
-# prefill MoE activations and the dense format the autotuner picks for speed. quality: an FP4 residual term on
-# top, and BF16 activations in the dense NVFP4/MXFP8 layers; closer to full precision token by token, about 21%
-# less prefill speed. Setting either variable below directly wins.
-PRECISION="${PRECISION:-fast}"
-if [[ "${PRECISION}" == quality ]]; then
-  export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-2}"
-  export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-a16}"
-else
-  export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-1}"
-  export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-auto}"
-fi
 # The serve container stays offline once the snapshot is on disk. prepare.sh turns this off for the download.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
@@ -140,8 +140,6 @@ SPARK_ENV=(
   VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE
   VLLM_B12X_MOE_FP4_FORCE_A16
   B12X_W4A16_A4_PREFILL
-  B12X_W4A16_A4_PREFILL_TERMS
-  VLLM_B12X_DENSE_ACTIVATION_MODE
   PLE_QUEUE_DEPTH
   HF_HUB_OFFLINE
 )
@@ -149,7 +147,36 @@ SPARK_ENV=(
 # More container environment, as space-separated NAME=value pairs: EXTRA_ENV="B12X_FOO=1 B12X_BAR=2".
 EXTRA_ENV="${EXTRA_ENV:-}"
 
+# Remove the SPARK_ENV names a profile listed in SPARK_ENV_OMIT (fork-only
+# variables that the upstream v0.32 image must not receive).
+apply_spark_env_omit() {
+  local -a omit=() kept=()
+  read -r -a omit <<< "${SPARK_ENV_OMIT}" || true
+  if (( ${#omit[@]} > 0 )); then
+    local name o drop
+    for name in "${SPARK_ENV[@]}"; do
+      drop=0
+      for o in "${omit[@]}"; do
+        [[ "${name}" == "${o}" ]] && drop=1
+      done
+      (( drop )) || kept+=("${name}")
+    done
+    SPARK_ENV=("${kept[@]}")
+  fi
+}
+apply_spark_env_omit
+
 HF_CACHE="${HF_CACHE:-${HF_HOME:-${HOME}/.cache/huggingface}}"
+# Kernel caches. A profile that serves a different vLLM/FlashInfer build sets KERNEL_CACHE_DIR so its
+# compiled kernels never mix with the default image's (both write b12x, FlashInfer and Triton caches).
+KERNEL_CACHE_DIR="${KERNEL_CACHE_DIR:-}"
+if [[ -n "${KERNEL_CACHE_DIR}" ]]; then
+  [[ "${KERNEL_CACHE_DIR}" == /* ]] || KERNEL_CACHE_DIR="${HOME}/${KERNEL_CACHE_DIR}"
+  VLLM_CACHE="${VLLM_CACHE:-${KERNEL_CACHE_DIR}/vllm}"
+  FLASHINFER_CACHE="${FLASHINFER_CACHE:-${KERNEL_CACHE_DIR}/flashinfer}"
+  TRITON_CACHE="${TRITON_CACHE:-${KERNEL_CACHE_DIR}/triton}"
+  B12X_CACHE="${B12X_CACHE:-${KERNEL_CACHE_DIR}/b12x}"
+fi
 VLLM_CACHE="${VLLM_CACHE:-${HOME}/.cache/vllm}"
 FLASHINFER_CACHE="${FLASHINFER_CACHE:-${HOME}/.cache/flashinfer}"
 TRITON_CACHE="${TRITON_CACHE:-${HOME}/.triton}"
@@ -275,15 +302,6 @@ validate_config() {
   if [[ -n "${YARN_FACTOR}" ]] && { ! is_uint "${YARN_FACTOR}" || (( YARN_FACTOR < 1 || YARN_FACTOR > 16 )); }; then
     die "YARN_FACTOR is 1 to 16, not ${YARN_FACTOR}"
   fi
-  if [[ ! "${PRECISION}" =~ ^(quality|fast)$ ]]; then
-    die "PRECISION is quality or fast, not ${PRECISION}"
-  fi
-  if [[ ! "${B12X_W4A16_A4_PREFILL_TERMS}" =~ ^[12]$ ]]; then
-    die "B12X_W4A16_A4_PREFILL_TERMS is 1 or 2, not ${B12X_W4A16_A4_PREFILL_TERMS}"
-  fi
-  if [[ ! "${VLLM_B12X_DENSE_ACTIVATION_MODE}" =~ ^(auto|a16|quantized)$ ]]; then
-    die "VLLM_B12X_DENSE_ACTIVATION_MODE is auto, a16, or quantized, not ${VLLM_B12X_DENSE_ACTIVATION_MODE}"
-  fi
   if ! is_uint "${NATIVE_MAX_LEN}" || (( NATIVE_MAX_LEN < 1 )); then
     die "NATIVE_MAX_LEN is a positive integer, not ${NATIVE_MAX_LEN}"
   fi
@@ -305,6 +323,9 @@ validate_config() {
   fi
   if [[ -z "${VLLM_PLE_TABLE_MEMORY}" ]]; then
     die "VLLM_PLE_TABLE_MEMORY is empty"
+  fi
+  if [[ -n "${ENGRAM_CONFIG}" && ! "${ENGRAM_CONFIG}" =~ ^\{.*\}$ ]]; then
+    die "ENGRAM_CONFIG is a JSON object like {\"host_file_gather\":true}, not ${ENGRAM_CONFIG}"
   fi
   if [[ ! "${PREPARE}" =~ ^(auto|0|1)$ ]]; then
     die "PREPARE is auto, 0, or 1, not ${PREPARE}"
@@ -418,8 +439,13 @@ build_docker_cmd() {
   if (( MTP_TOKENS > 0 )); then
     DOCKER_CMD+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS}}")
   fi
+  if [[ -n "${GDN_DECODE_KERNEL}" ]]; then
+    DOCKER_CMD+=(--gdn-decode-kernel "${GDN_DECODE_KERNEL}")
+  fi
+  if [[ -n "${ENGRAM_CONFIG}" ]]; then
+    DOCKER_CMD+=(--engram-config "${ENGRAM_CONFIG}")
+  fi
   DOCKER_CMD+=(
-    --gdn-decode-kernel "${GDN_DECODE_KERNEL}"
     --linear-backend "${LINEAR_BACKEND}"
     --moe-backend "${MOE_BACKEND}"
     --no-enable-flashinfer-autotune

@@ -1,0 +1,27 @@
+From 4ed49b1c7bf6a8d6ccf150c83eec66faac2547d7 Mon Sep 17 00:00:00 2001
+From: Alfonso Fortunato <57877156+devopsfortunato@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:46:10 +0200
+Subject: Include the Flash Next draft vocabulary in exported vLLM wheels
+
+Pulled from eugr/spark-vllm-docker 15-package-draft-vocab.patch at
+eadf57d. setup.py package-data rule so the wheel ships the 32k draft
+vocabulary JSON.
+---
+ setup.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/setup.py b/setup.py
+index 37bfc3e41..c0511c167 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1600,6 +1600,7 @@ package_data = {
+     "vllm": [
+         "py.typed",
+         "libs/*.so*",
++        "model_executor/layers/draft_vocab_lists/*.json",
+         "model_executor/layers/fused_moe/configs/*.json",
+         "model_executor/layers/quantization/utils/configs/*.json",
+         "entrypoints/serve/instrumentator/static/*.js",
+-- 
+2.55.0
+

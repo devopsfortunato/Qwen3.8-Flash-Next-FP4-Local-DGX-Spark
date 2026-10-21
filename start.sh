@@ -42,9 +42,14 @@ flock -n 8 || die "another ./start.sh or ./stop.sh is running; wait for it to fi
 B=$'\033[1m'; M=$'\033[1;35m'; G=$'\033[1;32m'; D=$'\033[2m'; R=$'\033[0m'
 [[ -t 1 ]] || { B=; M=; G=; D=; R=; }
 printf '\n%sQwen3.8 Flash Next FP4 Local%s\n' "${M}" "${R}"
+# Where the PLE n-gram tables live: engram config on the upstream lane, VLLM_PLE_TABLE_MEMORY otherwise.
+PLE_LINE="${VLLM_PLE_TABLE_MEMORY} (${B12X_DISK_BACKEND})"
+if [[ -n "${ENGRAM_CONFIG}" ]]; then
+  PLE_LINE="engram ${ENGRAM_CONFIG}"
+fi
 printf '%s %s · %s seqs · %s-token window · %s KV · MTP %s · PLE %s · port %s%s\n' \
   "${D}" "${MODEL_ID}" "${MAX_NUM_SEQS}" "${MAX_MODEL_LEN}" "${KV_CACHE_DTYPE}" \
-  "${MTP_TOKENS}" "${VLLM_PLE_TABLE_MEMORY}" "${PORT}" "${R}"
+  "${MTP_TOKENS}" "${PLE_LINE}" "${PORT}" "${R}"
 PROFILE_LINE="default"
 if [[ -n "${PROFILE}" ]]; then
   PROFILE_LINE="${PROFILE} (profiles/${PROFILE}.env)"
@@ -156,7 +161,7 @@ fi
 
 if is_recipe_image; then
   log "PLE queue depth ${PLE_QUEUE_DEPTH} (${IMAGE}, built from ${BASE_IMAGE})"
-elif [[ "${PLE_QUEUE_DEPTH}" != 64 ]]; then
+elif [[ "${PLE_QUEUE_DEPTH}" != 64 && " ${SPARK_ENV[*]} " == *" PLE_QUEUE_DEPTH "* ]]; then
   warn "${IMAGE} is not the recipe image: PLE_QUEUE_DEPTH=${PLE_QUEUE_DEPTH} has no effect there"
 fi
 
@@ -271,7 +276,7 @@ cat <<EOF
   Window       ${MAX_MODEL_LEN} tokens · ${MAX_NUM_SEQS} at once · ${KV_CACHE_DTYPE} KV · MTP ${MTP_TOKENS}
   Profile      ${PROFILE_LINE}
   KV cache     ${KV_TOKENS:-see docker logs} tokens · pool ${KV_LINE}
-  PLE table    ${VLLM_PLE_TABLE_MEMORY} (${B12X_DISK_BACKEND})
+  PLE table    ${PLE_LINE}
   Loaded in    ${LOADED_S}s
   Logs         docker logs -f ${CONTAINER_NAME}
   Restart      ./start.sh restart
