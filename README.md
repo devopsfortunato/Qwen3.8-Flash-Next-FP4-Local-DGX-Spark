@@ -500,13 +500,23 @@ also serves this checkpoint — its pinned recipe
 `local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD` carries byte-identical weights to
 `nvidia/Qwen3.8-Flash-Next-FP4-Local`. Two things it does notably better than both vLLM lanes here:
 
-| | vLLM (either lane) | Flare 47581cc, TP1, MTP 5 |
+| | vLLM (either lane) | Flare 47581cc, TP1 |
 |---|---:|---:|
 | Cold start to serving (weights warm on disk) | about 9 minutes | **21 seconds** |
-| KV cache in the 27-31 GB budget | 1,575,180 (default) / 1,751,020 (vllm-0.32) | **2,019,328** (~7.7 full 262k requests) |
+| KV cache, tokens | 1,575,180 (default) / 1,751,020 (vllm-0.32) | **2,019,328** (~7.7 full 262k requests) |
 
-Its prefill on the synthetic 8k/16k/32k ladder is 2,370 t/s, below both vLLM lanes. A full comparison
-(decode, context ladder, tool-eval, sixcat) is being measured.
+Everything else is level or behind. The package was exported at 5 draft tokens and serves at
+`flare run PACKAGE --mtp-draft-tokens 3 --no-mtp-adaptive-verification`. Its default, 5 drafts with
+adaptive verification, decodes at 31.02 t/s and scored 85 on one tool-eval run.
+
+| | Default | vllm-0.32 | Flare, 3 drafts, fixed width |
+|---|---:|---:|---:|
+| Decode, 512 tokens (geomean) | **45.58** | 45.23 | 43.55 |
+| Prefill, synthetic 8k/16k/32k | 2,411 | **2,596** | 2,370 (measured on Flare's default) |
+| tool-eval-bench 2.8.1, two runs | **89 · 90** | 88 · 87 | 88 · 89 |
+
+Its second tool-eval run had 5 safety-critical failures (3 on the default), which caps that run's rating
+at Adequate. Sixcat was not run, and perplexity cannot be: Flare does not return prompt logprobs.
 
 ### Earlier: TensorFold INT4 on an older image
 
