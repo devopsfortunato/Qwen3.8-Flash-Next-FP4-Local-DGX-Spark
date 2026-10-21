@@ -27,7 +27,7 @@ unset_recipe() {
     FLASHINFER_CACHE TRITON_CACHE B12X_CACHE STATE_DIR LOG_DIR MIN_FREE_GB IMAGE_FREE_GB \
     MEM_NEED_GIB MEM_FLOOR_GIB MEM_FLOOR_GRACE MEM_HARD_FLOOR_GIB MEM_CHECK WAIT_TIMEOUT STOP_TIMEOUT \
     STOP_LOCK_WAIT PREPARE PULL DRY_RUN FOREGROUND PROFILE PROFILE_DIR PROFILE_FILE \
-    KV_CACHE_MEMORY_BYTES YARN_FACTOR NATIVE_MAX_LEN EXTRA_ENV PLE_QUEUE_DEPTH \
+    KV_CACHE_MEMORY_BYTES YARN_FACTOR NATIVE_MAX_LEN EXTRA_ENV CPUSET PLE_QUEUE_DEPTH \
     ENGRAM_CONFIG SPARK_ENV_OMIT KERNEL_CACHE_DIR || true
 }
 
@@ -231,6 +231,13 @@ pass "the recipe image tag follows BASE_IMAGE, and another IMAGE is not the reci
   EXTRA_ENV="B12X_TEST_A=1 B12X_TEST_B=two"
   validate_config
   build_docker_cmd --max-num-seqs 2
+  if has_word "--cpuset-cpus"; then
+    exit 1
+  fi
+  CPUSET="5-9,15-19"
+  validate_config
+  build_docker_cmd --max-num-seqs 2
+  has_pair --cpuset-cpus 5-9,15-19
   has_pair -e B12X_TEST_A=1
   has_pair -e B12X_TEST_B=two
   has_pair --port 9001
@@ -382,6 +389,7 @@ for bad in \
   'MEM_HARD_FLOOR_GIB=9' \
   'PROFILE=no-such-profile' \
   'EXTRA_ENV=not-a-pair' \
+  'CPUSET=fast-cores' \
   'PREPARE=maybe' \
   'MODEL_ID=not-a-repo'
 do
