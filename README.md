@@ -342,54 +342,64 @@ serves a base image as is, at queue depth 64.
 
 ## Benchmarks
 
-### Summary: default, vllm-0.32 and Flare
+### Summary: five ways to serve this checkpoint
 
-The three ways to serve this checkpoint that are worth running, measured on 2026-10-20/21 on one Spark, thinking
-off, temperature 0. Flare means Flare with the [MXFP8 LM head](#the-mxfp8-lm-head), the way to run it if you do.
+Five ways to serve this checkpoint, measured on 2026-10-20/22 on one Spark, thinking off, temperature 0. All five
+load the same weights, NVIDIA's FP4-Local at revision `b9ce18a6`; Flare `47581cc` loaded a byte-identical copy
+from another repo. The LM head row says how each serves the output head: MXFP8 when the recipe quantizes the
+checkpoint's BF16 head after loading ([MXFP8 LM head](#the-mxfp8-lm-head)), BF16 when it serves it as shipped.
 
-| | Default | vllm-0.32 (opt-in) | Flare + MXFP8 head |
-|---|---:|---:|---:|
-| Decode C=1, prose median (t/s) | 41.9 | 40.8 | **46.7** |
-| Decode C=1, code median | 53.8 | 54.8 | **56.2** |
-| Decode C=1, peak (best context size) | 57.0 | 58.0 | **58.9** |
-| Decode C=1, peak (best 10 s while writing code) | 59.4 | 61.0 | **64.7** |
-| Decode C=1, 8 mixed prompts | 45.0 | 44.4 | **46.6** |
-| Decode C=8, per stream | 15.9 | **17.5** | 12.4 |
-| Decode C=8, total | 119.4 | **128.4** | 97.4 |
-| Prefill C=1, prose median (t/s) | 2,093 | **2,295** | 2,063 |
-| Prefill C=1, code median | 2,108 | **2,347** | 2,246 |
-| Prefill C=1, 8k prompt | 2,145 | **2,265** | 1,989 |
-| Prefill C=8, total (8 x 8k) | 2,203 | **2,355** | 2,126 |
-| Prefill C=8, first token median / last | 22.0 / 29.9 s | **16.6 / 28.0 s** | 29.8 / 31.0 s |
-| First token, cold 128k prose | 62.1 s | **58.1 s** | 61.4 s |
-| tool-eval-bench 2.8.1 | **89 · 90** | 88 · 87 | 88 · 89 |
-| sixcat-eval 0.8.3 | **92.1** | 90.6 | 90.2 |
-| Perplexity checks | yes | yes | no prompt logprobs |
-| KV cache, tokens | 1,575,180 | 1,751,020 | **2,007,040** |
-| Start to serving | 233-245 s | 498 s | **21-24 s** |
-| 128k: next question in the same chat (history sent) | **0.65 s** | 1.38 s | 0.91 s |
-| 128k: same document re-sent with a new question | 4.0 s | **1.35 s** | 60.6 s |
-| Maintenance | pinned eugr nightly | 21 patches over v0.32.0 | 29-line patch, 17-24 min re-export per update |
-| **Use it for** | **the default** | prefill, many users, documents re-sent with each question | fast restarts, one user, long-context decode, most KV |
+| | Default | vllm-0.32 (opt-in) | Flare 47581cc + MXFP8 head | Flare 5f37bd1 (stock) | myllmbox v5.3 |
+|---|---:|---:|---:|---:|---:|
+| Decode C=1, prose median (t/s) | 41.9 | 40.8 | **46.7** | 43.8 | 46.2 |
+| Decode C=1, code median | 53.8 | 54.8 | 56.2 | 53.8 | **57.2** |
+| Decode C=1, peak (best context size) | 57.0 | 58.0 | 58.9 | 57.3 | **60.4** |
+| Decode C=1, peak (best 10 s while writing code) | 59.4 | 61.0 | 64.7 | 59.9 | **86.5** |
+| Decode C=1, 8 mixed prompts | 45.0 | 44.4 | 46.6 | 43.7 | **48.5** |
+| Decode C=8, per stream | 15.9 | 17.5 | 12.4 | 11.9 | **18.2** |
+| Decode C=8, total | 119.4 | 128.4 | 97.4 | 93.1 | **136.9** |
+| Prefill C=1, prose median (t/s) | 2,093 | 2,295 | 2,063 | 2,057 | **2,328** |
+| Prefill C=1, code median | 2,108 | 2,346 | 2,246 | 2,176 | **2,366** |
+| Prefill C=1, 8k prompt | 2,145 | 2,265 | 1,989 | 2,166 | **2,336** |
+| Prefill C=8, total (8 x 8k) | 2,203 | **2,355** | 2,126 | 2,142 | 2,351 |
+| Prefill C=8, first token median / last | 22.0 / 29.9 s | 16.6 / 28.0 s | 29.8 / 31.0 s | 30.3 / 30.8 s | **15.8 / 28.0 s** |
+| First token, cold 128k prose | 62.1 s | 58.1 s | 61.4 s | 61.9 s | **56.2 s** |
+| tool-eval-bench 2.8.1 | **89 · 90** | 88 · 87 | 88 · 89 | 85 · 88 | 88 · 87 |
+| sixcat-eval 0.8.3 | **92.1** | 90.6 | 90.2 | 89.8 | 90.0 |
+| Perplexity, all windows · long | 1.0902 · 1.0470 | 1.0877 · 1.0444 | no prompt logprobs | 1.0890 · 1.0470 | 1.0863 · 1.0445 |
+| LM head | MXFP8 | MXFP8 | MXFP8 (draft head NVFP4) | BF16 | BF16 |
+| KV cache, tokens | 1,575,180 | 1,751,020 | 2,007,040 | **2,064,384** | 1,661,476 |
+| Start to serving | 233-245 s | 498 s | **21-24 s** | 22 s | 523 s first boot, ~7 min after |
+| 128k: next question in the same chat (history sent) | **0.65 s** | 1.38 s | 0.91 s | 0.85 s | 5.20 s |
+| 128k: same document re-sent with a new question | 4.02 s | **1.35 s** | 60.6 s | 61.6 s | 5.18 s |
+| 128k: document in its own message, new question | – | – | – | **0.57 s** | 5.07 s |
+| Maintenance | pinned eugr nightly | 21 patches over v0.32.0 | 29-line patch, 17-24 min re-export per update | no patch, 35 min export per update | their image, closed binary libraries |
+| **Use it for** | **the default** | prefill, documents re-sent with each question | fast restarts, one user, prose decode | fast restarts, most KV, documents sent as their own message | fastest decode and prefill, many users |
 
 Decode and prefill medians are over llm_context_benchmarks' 0.5k, 8k, 32k and 128k (mean of 2 runs per size),
 and the first peak is the best of those sizes. The second peak is the best 10-second window of a 3,000-token
 single-file HTML/JS answer, 3 runs. C=1 and C=8 run 8 different prompts for 512 tokens each, one at a time or all
 at once, and eight 8k-token documents with unique first lines; C=8 prefill is all prompt tokens over the time
-until the last first token. Follow-ups are from [Prefix cache](#prefix-cache).
+until the last first token. Follow-ups are from [Prefix cache](#prefix-cache). Both Flare columns run 3 drafts at
+fixed width. myllmbox ran as shipped except its host tuning (`vm.compaction_proactiveness` stays 20 here; its
+`tune-host.sh` needs root), which its README puts at about 10% of throughput.
 
-- **The default stays.** It has the best task scores, the only quality also checked by perplexity, level decode,
-  the next question in a chat under a second, and partial reuse when a document is re-sent with a new question
-  (4.0 s at 128k). It costs a 4-minute start and the smallest KV pool.
-- **vllm-0.32 is the fastest for prefill** (+10-11% on the medians), **with 8 streams** (128 t/s) and when a long
-  document is re-sent with a new question (1.35 s at 128k). Its tool-eval runs (87-88) keep it opt-in.
-- **Flare with the MXFP8 head starts in 21-24 s, holds 27% more KV and decodes fastest for one user**, most on
-  prose and long contexts. With 8 streams it is the slowest (97 t/s), it reuses nothing when a document is
-  re-sent with a new question, its sixcat is 1.9 points under the default, and it needs a local patch.
-- **Peak decode depends on what is being written.** [myllmbox's recipe](https://github.com/myllmbox/qwen38-flash-next-recipe)
-  reports 82.3 t/s as its best 10-second window while a request writes code, with drafts up to 7 deep and
-  thinking on; measured the same way with thinking off, these three give 59-65 t/s with 3 drafts. Its
-  whole-answer rate on long prose, 44.1 t/s, sits between the default and Flare here.
+- **The default stays.** It has the best task scores (tool-eval 89 · 90, sixcat 92.1), the next question in a chat
+  in 0.65 s, and partial reuse when a document is re-sent with a new question (4.0 s at 128k). It costs a
+  4-minute start and the smallest KV pool.
+- **vllm-0.32 is the fastest open lane for prefill** and when a long document is re-sent with a new question
+  (1.35 s at 128k). Its tool-eval runs (87-88) keep it opt-in.
+- **Flare 47581cc with the MXFP8 head starts in 21-24 s and decodes prose fastest** (46.7 t/s). With 8 streams it
+  is slow (97 t/s), and a document re-sent inside the question's message is recomputed (60.6 s at 128k). Its
+  29-line patch does not apply to Flare 5f37bd1 yet.
+- **Flare 5f37bd1 needs no patch, starts in 22 s and holds the most KV** (2.06M tokens). Its own defaults no
+  longer lose speed (42.3-42.5 t/s; 3 fixed drafts give 44.8-45.7), and it now reports prompt logprobs, so perplexity is
+  measurable: level with the default. It reuses a document sent as its own message (0.57 s at 128k) and nothing
+  when the document and the question share a message (61.6 s). With 8 streams it is the slowest (93 t/s).
+- **myllmbox v5.3 is the fastest for decode and prefill**: 48.5 t/s for one user, 136.9 t/s for eight, 86.5 t/s
+  at its best 10 s writing code. It costs about 2 points of task scores (sixcat 90.0, tool-eval 88 · 87), 5.1 s
+  for every 128k follow-up (it reuses 119,232 of about 130,250 tokens in every layout), a 9-minute first boot, and
+  closed binary libraries inside its image.
 
 ### Four recipes (earlier round)
 
@@ -598,7 +608,7 @@ answer, with the weights and compiled kernels already on disk; "page cache dropp
 - **Prefill is level with the default** and behind vllm-0.32 at every size (2-28%, 11% on the geomean).
 - **With 8 streams Flare is the slowest.** 97 t/s in total with the MXFP8 head (12.4 per stream), against 119 on
   the default and 128 on vllm-0.32; eight 8k-token prompts all get their first token after about 30 s, against a
-  median of 22 s and 17 s (see [Summary](#summary-default-vllm-032-and-flare)).
+  median of 22 s and 17 s (see [Summary](#summary-five-ways-to-serve-this-checkpoint)).
 - **tool-eval is level; sixcat is lower.** Stock Flare's four tool-eval runs average 88.3 (the default's two,
   89.5) and spread 86-90; its second run had 5 safety-critical failures (3 in each other run and on the
   default), which caps that run's rating at Adequate. sixcat is 89.5 against 92.1, most of it Truth (83 against
