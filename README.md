@@ -498,25 +498,95 @@ at a time, 512 output tokens, mean of 2 runs per size. Speculative decoding as e
 [flare-local-inference](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0, first published 2026-10-20)
 also serves this checkpoint — its pinned recipe
 `local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD` carries byte-identical weights to
-`nvidia/Qwen3.8-Flash-Next-FP4-Local`. Two things it does notably better than both vLLM lanes here:
+`nvidia/Qwen3.8-Flash-Next-FP4-Local`. Measured at `47581cc`, TP1, on the same Spark, thinking off and
+temperature 0. Two things it does notably better than both vLLM lanes here:
 
-| | vLLM (either lane) | Flare 47581cc, TP1 |
+| | vLLM | Flare |
 |---|---:|---:|
-| Cold start to serving (weights warm on disk) | about 9 minutes | **21 seconds** |
+| Start to serving, weights and compiled kernels already on disk | 242 s (default) | **21 s** |
 | KV cache, tokens | 1,575,180 (default) / 1,751,020 (vllm-0.32) | **2,019,328** (~7.7 full 262k requests) |
 
-Everything else is level or behind. The package was exported at 5 draft tokens and serves at
-`flare run PACKAGE --mtp-draft-tokens 3 --no-mtp-adaptive-verification`. Its default, 5 drafts with
-adaptive verification, decodes at 31.02 t/s and scored 85 on one tool-eval run.
+**Decode depends on two `flare run` flags.** The package was exported once with 5 draft tokens and keeps every
+smaller width, so each setting below is one 30-second restart:
 
-| | Default | vllm-0.32 | Flare, 3 drafts, fixed width |
+| `flare run` setting | Decode t/s, 512 tokens (geomean) |
+|---|---:|
+| 5 drafts, adaptive verification (Flare's default) | 31.02 |
+| 5 drafts, fixed width (`--no-mtp-adaptive-verification`) | 33.81 |
+| 3 drafts, adaptive (`--mtp-draft-tokens 3`) | 41.40 |
+| 2 drafts, fixed width | 42.36 |
+| 4 drafts, fixed width | 43.10 |
+| **3 drafts, fixed width** | **43.55** |
+
+The rest of this section uses 3 drafts with fixed width. On the default, Flare scored 85 on one tool-eval run.
+`--embedding-table-storage ram` (the n-gram table in memory instead of on NVMe) did not start serving within
+two minutes and was not pursued.
+
+| | Default | vllm-0.32 | Flare |
 |---|---:|---:|---:|
 | Decode, 512 tokens (geomean) | **45.58** | 45.23 | 43.55 |
-| Prefill, synthetic 8k/16k/32k | 2,411 | **2,596** | 2,370 (measured on Flare's default) |
-| tool-eval-bench 2.8.1, two runs | **89 · 90** | 88 · 87 | 88 · 89 |
+| Decode, prose 0.5k / 8k / 32k / 128k | 46.4 / 42.4 / 41.3 / 39.2 | 47.5 / 41.7 / 39.9 / 39.7 | 49.9 / 42.3 / 41.7 / 43.5 |
+| Decode, code 0.5k / 8k / 32k / 128k | 57.0 / 56.3 / 51.3 / 46.3 | 54.0 / 55.6 / 58.0 / 45.2 | 53.7 / 52.4 / 46.3 / 48.6 |
+| Prefill, synthetic 8k / 16k / 32k (geomean) | 2,411 | **2,596** | 2,383 |
+| Prefill, prose 0.5k / 8k / 32k / 128k | 1,057 / 2,086 / 2,174 / 2,100 | 1,252 / 2,343 / 2,373 / 2,247 | 1,141 / 1,995 / 2,194 / 2,106 |
+| Prefill, code 0.5k / 8k / 32k / 128k | 1,073 / 2,078 / 2,187 / 2,138 | 1,279 / 2,371 / 2,414 / 2,322 | 920 / 2,180 / 2,260 / 2,266 |
+| tool-eval-bench 2.8.1 | **89 · 90** | 88 · 87 | 88 · 89 · 86 · 90 |
+| sixcat-eval 0.8.3, 884 items | **92.1** | 90.6 (mean of 2 runs) | 89.5 |
 
-Its second tool-eval run had 5 safety-critical failures (3 on the default), which caps that run's rating
-at Adequate. Sixcat was not run, and perplexity cannot be: Flare does not return prompt logprobs.
+By context: [llm_context_benchmarks](https://github.com/ivanfioravanti/llm_context_benchmarks), 512 output tokens,
+mean of 2 runs; the default and vllm-0.32 ran it on 2026-10-20.
+
+- **Decode is close.** 4% behind the default over 512 tokens, ahead at 128k (43.5 against 39.2 on prose, 48.6
+  against 46.3 on code), behind on code up to 32k (46.3-53.7 against 51.3-57.0).
+- **Prefill is level with the default** (-14% to +8% by size, -1% on the synthetic ladder) and behind vllm-0.32
+  at every size.
+- **tool-eval is level.** Four runs average 88.3 (the default's two, 89.5), and they spread 86-90. The second
+  run had 5 safety-critical failures (3 in each other run, and on the default), which caps that run's rating at
+  Adequate. Perplexity cannot be measured: Flare does not return prompt logprobs.
+- **sixcat is lower.** 89.5 against 92.1, most of it Truth (83 against 89) and Tools (85 against 90, one item
+  of 20); Instruct 88 against 91, Code 93.9 against 96.3, Math 98 on both, Knowledge 89.3 against 88.2.
+
+How it ran here, as two Docker images built on the Spark:
+
+- `flare:47581cc`, 125 MB, from Flare's own `Dockerfile`: serving only.
+- `flare-ignition:47581cc`, 33.7 GB: `nvcr.io/nvidia/pytorch:26.07-py3` plus Flare's
+  `uv sync --locked --extra prepare`, for `ignition export qwen3.8-flash --gpus 0 --mtp-draft-tokens 5
+  --max-concurrency 8`. Both containers need `--security-opt seccomp=unconfined` (io_uring is blocked
+  otherwise), and the export's `--output` must be on the same filesystem as `~/.cache/flare`: the package
+  hard-links cached blobs, and a cross-device output fails at publish. The export took about 17 minutes; the
+  package is 107 GB, stored once through the hard links.
+- Serving: `flare run PACKAGE --gpus 0 --mtp-draft-tokens 3 --no-mtp-adaptive-verification
+  --served-model-name nvidia/Qwen3.8-Flash-Next-FP4-Local`, approving the development publisher key the export
+  generated (`--publisher-keys`, `--dangerously-approve-key`, `--dangerously-accept-publisher local-development`).
+
+### Prefix cache
+
+Both servers keep finished prompts so that a later request repeating a prefix skips recomputing it. One request
+at a time, chat completions, thinking off, temperature 0, 64 output tokens. Each scenario is its own pair: a cold
+request on a fresh document (an llm_context_benchmarks prose file behind a unique first line), then the
+follow-up. Reused tokens are what each server reports: vLLM's prefix-cache hit counter, Flare's
+`cached_tokens`. vllm-0.32 was not measured; Flare ran with 3 drafts, fixed width.
+
+| Time to first token, s | Default 8k | Default 32k | Default 128k | Flare 8k | Flare 32k | Flare 128k |
+|---|---:|---:|---:|---:|---:|---:|
+| Cold, mean of the four cold requests | 4.03 | 15.06 | 62.06 | 4.06 | 15.19 | 62.27 |
+| The same request again | 0.08 | 0.14 | 0.45 | 0.03 | 0.08 | 0.39 |
+| Document in the system message, a new question | 0.24 | 0.30 | 0.63 | 0.21 | 0.27 | 0.55 |
+| The next turn: first question, its answer, a new question | 0.25 | 0.31 | 0.65 | 0.30 | 0.39 | 0.85 |
+| Document and question in one user message, a new question | 2.12 | 3.87 | 4.02 | 3.98 | 15.18 | 62.30 |
+
+- **At message boundaries both reuse everything shared.** Only the new question, 24-28 tokens, is computed, and
+  a 128k follow-up starts in 0.55-0.85 s instead of 62 s. Flare is faster on a repeat and a new question, the
+  default on the next turn.
+- **Inside a message only the default reuses.** Flare keeps states only at instruction, prompt and answer
+  boundaries ([its design](https://github.com/NVIDIA/flare-local-inference/blob/main/docs/cli-design.md)), so a
+  new question after a document in the same user message reuses nothing and pays the full prefill again, 62 s
+  at 128k. The default resumes from the last GDN state it kept inside the document (4,096, 24,576 and 122,880
+  tokens in) and recomputes the rest: 2.1, 3.9 and 4.0 s. For reuse on both, send long documents as the system
+  message.
+- **A cached answer can differ.** At temperature 0 the repeated request answered differently from the cold one
+  on Flare at all three sizes (from character 27-95) and on the default at 8k (character 159). Three samples
+  each.
 
 ### Earlier: TensorFold INT4 on an older image
 
