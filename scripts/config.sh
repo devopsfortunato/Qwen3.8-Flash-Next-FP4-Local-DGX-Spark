@@ -121,18 +121,6 @@ export B12X_W4A16_A4_PREFILL="${B12X_W4A16_A4_PREFILL:-1}"
 # the recipe image reads this variable instead (docker/ple_queue_depth.py). 256: prefill about 4% faster,
 # identical output. Other images ignore it.
 PLE_QUEUE_DEPTH="${PLE_QUEUE_DEPTH:-256}"
-# Activation precision (README, Precision). fast (the default): the model card's settings, one FP4 term for
-# prefill MoE activations and the dense format the autotuner picks for speed. quality: an FP4 residual term on
-# top, and BF16 activations in the dense NVFP4/MXFP8 layers; closer to full precision token by token, about 21%
-# less prefill speed. Setting either variable below directly wins.
-PRECISION="${PRECISION:-fast}"
-if [[ "${PRECISION}" == quality ]]; then
-  export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-2}"
-  export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-a16}"
-else
-  export B12X_W4A16_A4_PREFILL_TERMS="${B12X_W4A16_A4_PREFILL_TERMS:-1}"
-  export VLLM_B12X_DENSE_ACTIVATION_MODE="${VLLM_B12X_DENSE_ACTIVATION_MODE:-auto}"
-fi
 # The serve container stays offline once the snapshot is on disk. prepare.sh turns this off for the download.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
@@ -152,8 +140,6 @@ SPARK_ENV=(
   VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE
   VLLM_B12X_MOE_FP4_FORCE_A16
   B12X_W4A16_A4_PREFILL
-  B12X_W4A16_A4_PREFILL_TERMS
-  VLLM_B12X_DENSE_ACTIVATION_MODE
   PLE_QUEUE_DEPTH
   HF_HUB_OFFLINE
 )
@@ -315,15 +301,6 @@ validate_config() {
   fi
   if [[ -n "${YARN_FACTOR}" ]] && { ! is_uint "${YARN_FACTOR}" || (( YARN_FACTOR < 1 || YARN_FACTOR > 16 )); }; then
     die "YARN_FACTOR is 1 to 16, not ${YARN_FACTOR}"
-  fi
-  if [[ ! "${PRECISION}" =~ ^(quality|fast)$ ]]; then
-    die "PRECISION is quality or fast, not ${PRECISION}"
-  fi
-  if [[ ! "${B12X_W4A16_A4_PREFILL_TERMS}" =~ ^[12]$ ]]; then
-    die "B12X_W4A16_A4_PREFILL_TERMS is 1 or 2, not ${B12X_W4A16_A4_PREFILL_TERMS}"
-  fi
-  if [[ ! "${VLLM_B12X_DENSE_ACTIVATION_MODE}" =~ ^(auto|a16|quantized)$ ]]; then
-    die "VLLM_B12X_DENSE_ACTIVATION_MODE is auto, a16, or quantized, not ${VLLM_B12X_DENSE_ACTIVATION_MODE}"
   fi
   if ! is_uint "${NATIVE_MAX_LEN}" || (( NATIVE_MAX_LEN < 1 )); then
     die "NATIVE_MAX_LEN is a positive integer, not ${NATIVE_MAX_LEN}"

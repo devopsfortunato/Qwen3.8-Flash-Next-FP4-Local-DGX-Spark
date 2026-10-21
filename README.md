@@ -14,11 +14,9 @@ here (see [Image](#image)), with the DGX Spark flags from the
 `--load-format b12x`, `--quantization modelopt_mixed`, and FP8 KV cache. MTP drafts 3 tokens, not the model
 card's 4: on a Spark it decodes as fast and leaves 4-9% more KV cache (see [Benchmarks](#benchmarks)).
 
-Activations follow the model card by default (`PRECISION=fast`). `PRECISION=quality` is opt-in. It adds a
-second FP4 term for the prefill MoE rounding residual and keeps BF16 activations in the dense NVFP4/MXFP8
-layers. Token by token it tracks a full-precision run about twice as closely, at about 21% less prefill speed.
-Both pass the same quality gate. On the task benchmarks fast matches quality: sixcat 92.1 vs 91.7, tool-eval
-89 vs 90. So the faster setting is the default (see [Precision](#precision)).
+Activations follow the model card. A higher-precision setting (two FP4 terms for the prefill MoE activations,
+BF16 activations in the dense layers) was measured and left out: twice as close to a full-precision run token
+by token, 21% slower prefill, and no gain on the task benchmarks (see [Precision](#precision)).
 
 The checkpoint is about 96 GiB on disk. NVIDIA's model card says a DGX Spark can run it with or without PLE
 offload, and reports 1M tokens of FP8 KV cache with PLE offload. This recipe follows the model card's Spark
@@ -27,9 +25,8 @@ command: `VLLM_PLE_TABLE_MEMORY=disk` and a 262,144-token window.
 `./start.sh` prepares the machine on the first run and starts the server. `./stop.sh` stops it.
 
 > **Status:** tested on one DGX Spark (GB10, 121 GB unified memory). At a 128k prose context: prefill
-> 2,114 t/s, decode 39 t/s, TTFT 62 s (`PRECISION=quality`, measured before the PLE queue-depth change: 1,515
-> t/s, 38 t/s, 86 s). 1,575,180 tokens of FP8 KV cache: six full 262k requests at once, up to 8 decoded
-> together. sixcat 92.1, tool-eval 89/100. See [Benchmarks](#benchmarks).
+> 2,114 t/s, decode 39 t/s, TTFT 62 s. 1,575,180 tokens of FP8 KV cache: six full 262k requests at once, up to
+> 8 decoded together. sixcat 92.1, tool-eval 89/100. See [Benchmarks](#benchmarks).
 
 ## Quick start
 
@@ -141,9 +138,6 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | `KV_CACHE_MEMORY_BYTES` | `31150000000` | KV pool in bytes (`--kv-cache-memory-bytes`): 1,575,180 FP8 tokens. Empty uses `GPU_MEMORY_UTILIZATION` |
 | `YARN_FACTOR` | empty | YaRN rope scaling past 262,144 positions; `4` allows a 1,048,576 window |
 | `PROFILE` | empty | opt-in launch profile from `profiles/` (see [Profiles](#profiles)) |
-| `PRECISION` | `fast` | activation precision; `fast` is the model card's, `quality` is closer to full precision (see [Precision](#precision)) |
-| `B12X_W4A16_A4_PREFILL_TERMS` | `1` (`quality`: `2`) | FP4 terms for prefill MoE activations |
-| `VLLM_B12X_DENSE_ACTIVATION_MODE` | `auto` (`quality`: `a16`) | activations of the dense NVFP4/MXFP8 layers |
 | `KV_CACHE_DTYPE` | `fp8` | KV cache dtype |
 | `QUANTIZATION` | `modelopt_mixed` | `--quantization` |
 | `LOAD_FORMAT` | `b12x` | `--load-format` |
@@ -170,8 +164,7 @@ The container also receives the rest of the model-card Spark environment:
 `SAFETENSORS_FAST_GPU=1`, `VLLM_WORKER_MULTIPROC_METHOD=spawn`, `VLLM_SSM_CONV_STATE_LAYOUT=DS`,
 `VLLM_USE_AOT_COMPILE=1`, `VLLM_USE_MEGA_AOT_ARTIFACT=1`, `VLLM_USE_V2_MODEL_RUNNER=1`,
 `B12X_POLICY_MODE=auto`, `VLLM_MXFP8_LM_HEAD=1`, `VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13`,
-`VLLM_B12X_MOE_FP4_FORCE_A16=1`, `B12X_W4A16_A4_PREFILL=1`. `B12X_W4A16_A4_PREFILL_TERMS` and
-`VLLM_B12X_DENSE_ACTIVATION_MODE` come from `PRECISION`.
+`VLLM_B12X_MOE_FP4_FORCE_A16=1`, `B12X_W4A16_A4_PREFILL=1`.
 
 `vllm serve` is started with `--enable-prefix-caching`, `--enable-chunked-prefill`,
 `--mamba-cache-mode align`, `--gdn-decode-kernel b12x`, `--linear-backend b12x`, `--moe-backend b12x`,
@@ -249,18 +242,15 @@ the kernels; the cap of 6 has not been booted yet. It costs memory: `MemAvailabl
 `1m` stretches the checkpoint's 262,144 positions 4x with YaRN, which changes every answer, short ones included.
 A needle hidden in 524,288 and in 1,040,000 tokens of text was found 5 times out of 5 at each length.
 tool-eval-bench 2.7.1 scored 89 (default on the same version: 89 and 91), and perplexity on fresh text rose from
-2.205 to 2.248. These `1m` numbers were measured with `PRECISION=fast`, the default. Use it when a window past
+2.205 to 2.248. These `1m` numbers were measured with the default activations. Use it when a window past
 262,144 matters more than the last bit of quality.
 
 ## Precision
 
-`PRECISION=fast` (the default) sets `B12X_W4A16_A4_PREFILL_TERMS=1` and `VLLM_B12X_DENSE_ACTIVATION_MODE=auto`,
-the model card's values. `PRECISION=quality` sets `2` and `a16`. Either variable set directly wins over
-`PRECISION`.
-
-```bash
-PRECISION=quality ./start.sh
-```
+The recipe runs the model card's activations: FP4 prefill activations for the MoE, and the dense NVFP4/MXFP8
+layers in the format the autotuner picks. A `PRECISION=quality` switch used to add a second FP4 term for the
+prefill MoE rounding residual (`B12X_W4A16_A4_PREFILL_TERMS=2`) and BF16 activations in the dense layers
+(`VLLM_B12X_DENSE_ACTIVATION_MODE=a16`). It was removed: closer to full precision, slower, no better at tasks.
 
 Each setting was compared token by token with the most precise run the image allows: BF16 KV cache, BF16
 prefill activations, BF16 dense activations, and a BF16 LM head. The texts are book prose, code, a 96k-token
@@ -269,17 +259,16 @@ difference is 0.024, because its BF16 kernels are not deterministic.
 
 | Setting | Mean \|Δ logprob\| | Top-1 agreement | Repeat runs | Prefill t/s |
 | --- | ---: | ---: | --- | ---: |
-| `fast` (default, model card) | 0.039 | 98.59% | bit-identical | **1,718** |
-| `quality` | **0.020** | **99.23%** | bit-identical | 1,362 |
+| the recipe (model card) | 0.039 | 98.59% | bit-identical | **1,718** |
+| former `quality` | **0.020** | **99.23%** | bit-identical | 1,362 |
 | `B12X_W4A16_A4_PREFILL_TERMS=2` alone | 0.028 | 98.93% | bit-identical | 1,665 |
 | BF16 prefill activations (`B12X_W4A16_A4_PREFILL=0`) | 0.028 | 98.92% | differ | 1,625 |
 | `VLLM_B12X_DENSE_ACTIVATION_MODE=a16` alone | 0.037 | 98.67% | bit-identical | 1,386 |
 | BF16 LM head (`VLLM_MXFP8_LM_HEAD=0`) | 0.039 | 98.63% | bit-identical | decode -6% |
 
-`quality` is about twice as close to the precise run token by token. Measured as a shipping default on the same
-image, that does not carry over to the task benchmarks:
+Served as a default on the same image, the closer token-level match did not carry over to the tasks:
 
-| | `fast` (default) | `quality` |
+| | the recipe | former `quality` |
 | --- | ---: | ---: |
 | tool-eval-bench 2.8.1, 97 scenarios, two runs | 89 · 89 | 91 · 89 |
 | sixcat-eval 0.8.3, 884 items | **92.1** | 91.7 |
@@ -289,14 +278,8 @@ image, that does not carry over to the task benchmarks:
 | Decode, geometric mean, 0.5k-128k | **45.8 t/s** | 44.4 t/s |
 | Prefill, geometric mean | **1,717 t/s** | 1,362 t/s |
 | Time to first token, 128k prose | **65.5 s** | 86.0 s |
-| KV cache, default 27 GB pool | 1,365,333 | 1,365,333 |
 
-What `fast` gives up is about 0.5% perplexity on book prose and code. What it gains is 26% more prefill and
-20 s less wait at 128k, with sixcat a little higher. Pick `quality` when token-level fidelity to full precision
-matters more than prefill time.
-
-On the fresh texts `quality` is token by token closer to the precise run too, but its perplexity there is 1%
-higher than `fast`'s (the precise run: 2.198). On book prose and code it sits at the precise run's level.
+The two FP4/dense variables stay at the image's defaults (1 and `auto`), so the recipe no longer sets them.
 
 Tried and left out:
 
@@ -355,7 +338,8 @@ serves a base image as is, at queue depth 64.
 ## Benchmarks
 
 Four ways to serve the same model, on the same Spark, back to back. Each runs on its own defaults, with a
-262,144-token window, thinking off and temperature 0.
+262,144-token window, thinking off and temperature 0. `quality` is the former `PRECISION=quality` setting,
+removed since (see [Precision](#precision)).
 
 | Recipe | Engine | Weights | KV cache | Speculative decoding |
 | --- | --- | --- | --- | --- |

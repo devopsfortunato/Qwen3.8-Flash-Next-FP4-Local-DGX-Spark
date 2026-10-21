@@ -119,7 +119,7 @@ equivalents:
 | `--gdn-decode-kernel b12x` | dropped (flag does not exist upstream) |
 | `VLLM_MXFP8_LM_HEAD=1` | kept: patch 20 implements it on this lane |
 | `VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13` | dropped (fork-only) |
-| `B12X_POLICY_MODE`, `B12X_DISK_BACKEND`, `B12X_W4A16_A4_PREFILL*`, `VLLM_B12X_DENSE_ACTIVATION_MODE`, `PLE_QUEUE_DEPTH` | dropped (fork-only; `PRECISION=quality` has no upstream equivalent) |
+| `B12X_POLICY_MODE`, `B12X_DISK_BACKEND`, `B12X_W4A16_A4_PREFILL`, `PLE_QUEUE_DEPTH` | dropped (fork-only) |
 | `{"method":"mtp","num_speculative_tokens":3}` | unchanged: full-vocabulary MTP draft, as in the fork image |
 
 Kept because they exist in v0.32.0 and apply unchanged:
@@ -141,8 +141,6 @@ disables the post-load host-heap trim.
 - `--gdn-decode-kernel` GDN decode kernel choice and the fork's
   `VLLM_PLE_TABLE_MEMORY` selector (including its `io_uring` disk backend and
   the recipe image's `PLE_QUEUE_DEPTH` tuning) have no upstream counterpart.
-- `PRECISION=quality` (two-term prefill, BF16 dense activations) is
-  fork-only; the upstream lane always runs the default fast path.
 - Numerics differ from the fork image: no FP4 prefill activations
   (`B12X_W4A16_A4_PREFILL`) and upstream kernels in place of the fork's.
   Logprobs are not bit-identical to the pinned-image recipe; see the

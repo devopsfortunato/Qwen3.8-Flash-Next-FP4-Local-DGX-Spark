@@ -22,7 +22,7 @@ unset_recipe() {
     VLLM_WORKER_MULTIPROC_METHOD VLLM_SSM_CONV_STATE_LAYOUT VLLM_USE_AOT_COMPILE \
     VLLM_USE_MEGA_AOT_ARTIFACT VLLM_USE_V2_MODEL_RUNNER B12X_POLICY_MODE \
     VLLM_MXFP8_LM_HEAD VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE VLLM_B12X_MOE_FP4_FORCE_A16 \
-    B12X_W4A16_A4_PREFILL PRECISION B12X_W4A16_A4_PREFILL_TERMS VLLM_B12X_DENSE_ACTIVATION_MODE \
+    B12X_W4A16_A4_PREFILL \
     HF_HUB_OFFLINE HF_TOKEN HF_HOME HF_CACHE VLLM_CACHE \
     FLASHINFER_CACHE TRITON_CACHE B12X_CACHE STATE_DIR LOG_DIR MIN_FREE_GB IMAGE_FREE_GB \
     MEM_NEED_GIB MEM_FLOOR_GIB MEM_FLOOR_GRACE MEM_HARD_FLOOR_GIB MEM_CHECK WAIT_TIMEOUT STOP_TIMEOUT \
@@ -71,9 +71,6 @@ check_defaults() {
   [[ "${CUTE_DSL_ARCH}" == "sm_121a" ]] || return 1
   [[ "${VLLM_B12X_MOE_FP4_FORCE_A16}" == "1" ]] || return 1
   [[ "${B12X_W4A16_A4_PREFILL}" == "1" ]] || return 1
-  [[ "${PRECISION}" == "fast" ]] || return 1
-  [[ "${B12X_W4A16_A4_PREFILL_TERMS}" == "1" ]] || return 1
-  [[ "${VLLM_B12X_DENSE_ACTIVATION_MODE}" == "auto" ]] || return 1
 }
 
 check_cmd() {
@@ -121,8 +118,6 @@ check_cmd() {
   has_word "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13" || return 1
   has_word "VLLM_B12X_MOE_FP4_FORCE_A16=1" || return 1
   has_word "B12X_W4A16_A4_PREFILL=1" || return 1
-  has_word "B12X_W4A16_A4_PREFILL_TERMS=1" || return 1
-  has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=auto" || return 1
   has_word "PLE_QUEUE_DEPTH=256" || return 1
   has_word "--speculative-config" || return 1
   has_word '{"method":"mtp","num_speculative_tokens":3}' || return 1
@@ -252,30 +247,6 @@ pass "the recipe image tag follows BASE_IMAGE, and another IMAGE is not the reci
 )
 pass "environment overrides reach the docker command and the token stays off the command line"
 
-(
-  unset_recipe
-  PRECISION=quality
-  export PRECISION
-  cd "${tmp}"
-  # shellcheck source=scripts/config.sh
-  source "${CONFIG}"
-  validate_config
-  build_docker_cmd
-  has_word "B12X_W4A16_A4_PREFILL_TERMS=2"
-  has_word "VLLM_B12X_DENSE_ACTIVATION_MODE=a16"
-)
-(
-  unset_recipe
-  PRECISION=quality VLLM_B12X_DENSE_ACTIVATION_MODE=auto
-  export PRECISION VLLM_B12X_DENSE_ACTIVATION_MODE
-  cd "${tmp}"
-  # shellcheck source=scripts/config.sh
-  source "${CONFIG}"
-  [[ "${B12X_W4A16_A4_PREFILL_TERMS}" == "2" ]]
-  [[ "${VLLM_B12X_DENSE_ACTIVATION_MODE}" == "auto" ]]
-)
-pass "PRECISION=quality sets the two-term prefill and BF16 dense activations, and a variable set directly wins"
-
 prof_dir="${tmp}/profiles"
 mkdir -p "${prof_dir}"
 printf 'KV_CACHE_MEMORY_BYTES=30000000000\nYARN_FACTOR=4\nMAX_MODEL_LEN=1048576\nPORT=7000\n' > "${prof_dir}/test.env"
@@ -356,8 +327,7 @@ done
   # Fork-only container variables must not reach the upstream image.
   for fork in "VLLM_PLE_TABLE_MEMORY=disk" "B12X_DISK_BACKEND=io_uring" "B12X_POLICY_MODE=auto" \
     "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13" \
-    "B12X_W4A16_A4_PREFILL=1" "B12X_W4A16_A4_PREFILL_TERMS=1" \
-    "VLLM_B12X_DENSE_ACTIVATION_MODE=auto" "PLE_QUEUE_DEPTH=256"; do
+    "B12X_W4A16_A4_PREFILL=1" "PLE_QUEUE_DEPTH=256"; do
     if has_word "${fork}"; then exit 1; fi
   done
   # The variables that do exist upstream stay.
@@ -392,7 +362,7 @@ dry32="$(DRY_RUN=1 PROFILE=vllm-0.32 IMAGE=dummy:tag "${ROOT}/start.sh")"
 printf '%s\n' "${dry32}" | grep -q -- '--engram-config' || fail "vllm-0.32 dry run dropped --engram-config"
 printf '%s\n' "${dry32}" | grep -q -- '--gdn-decode-kernel' && fail "vllm-0.32 dry run kept --gdn-decode-kernel"
 for fork in VLLM_PLE_TABLE_MEMORY B12X_DISK_BACKEND B12X_POLICY_MODE \
-  VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE B12X_W4A16_A4_PREFILL VLLM_B12X_DENSE_ACTIVATION_MODE PLE_QUEUE_DEPTH; do
+  VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE B12X_W4A16_A4_PREFILL PLE_QUEUE_DEPTH; do
   printf '%s\n' "${dry32}" | grep -q -- "-e ${fork}=" && fail "vllm-0.32 dry run leaks ${fork}"
 done
 printf '%s\n' "${dry32}" | grep -q 'dummy:tag serve' || fail "vllm-0.32 dry run dropped IMAGE"
@@ -408,10 +378,7 @@ for bad in \
   'MAX_MODEL_LEN=1048576' \
   'YARN_FACTOR=0' \
   'KV_CACHE_MEMORY_BYTES=30G' \
-  'PRECISION=max' \
   'PLE_QUEUE_DEPTH=128' \
-  'B12X_W4A16_A4_PREFILL_TERMS=3' \
-  'VLLM_B12X_DENSE_ACTIVATION_MODE=bf16' \
   'MEM_HARD_FLOOR_GIB=9' \
   'PROFILE=no-such-profile' \
   'EXTRA_ENV=not-a-pair' \
