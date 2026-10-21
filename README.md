@@ -191,7 +191,15 @@ read as data, and `.env` and the environment still win over it. The default need
 | none | 262,144 | 31.15 GB | 1,575,180 | 6.0 | the default; cap 8; lowest `MemAvailable` while serving 6.9 GiB; floor 6 GiB |
 | `kv-max` | 262,144 | 34 GB | 1,719,161 | 6.6 | cap 6; lowest `MemAvailable` while serving 4.4 GiB; floor 4 GiB |
 | `1m` | 1,048,576 | 30 GB | 1,931,132 | 1.8 | test profile: YaRN 4x, floor 4 GiB |
-| `vllm-0.32` | 262,144 | 31.15 GB | 1,751,020 | 6.7 | upstream vLLM v0.32.0 plus `vllm-0.32/series`, image built by `vllm-0.32/build.sh`; fork-only flags replaced (see `vllm-0.32/README.md`) |
+| `vllm-0.32` | 262,144 | 31.15 GB | 1,751,020 | 6.7 | opt-in: upstream vLLM v0.32.0 plus `vllm-0.32/series`, image built by `vllm-0.32/build.sh` (see below) |
+
+`vllm-0.32` serves the same checkpoint on upstream vLLM v0.32.0 instead of eugr's fork: build the image once on
+the Spark with `vllm-0.32/build.sh`, then `PROFILE=vllm-0.32 ./start.sh`. Against the default image, same day:
+prefill 7-19% faster on 0.5k-128k prompts, decode the same (45.2 against 45.6 t/s), 11% more KV in the same
+pool, perplexity equal or lower. tool-eval-bench scored 87-88 on all four runs (default image 89-90) and
+sixcat-eval 90.6 (92.1), the gap being 2 of its 20 tool items; prompts render identically on both, and the
+failing scenarios move with the numerics. It stays opt-in until more runs settle that. Details, patches and
+every measurement: [`vllm-0.32/README.md`](vllm-0.32/README.md).
 
 The default pool is pinned at 31.15 GB: 1,575,180 FP8 tokens, six full 262,144-token requests at once. Up to 8
 requests decode together, and all 8 fit while they average under about 196k tokens each. Past that vLLM pauses
