@@ -493,6 +493,21 @@ at a time, 512 output tokens, mean of 2 runs per size. Speculative decoding as e
 
 ![Speed by context length](docs/four-speed.png)
 
+### Flare (NVIDIA's new engine, first look)
+
+[flare-local-inference](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0, first published 2026-10-20)
+also serves this checkpoint — its pinned recipe
+`local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD` carries byte-identical weights to
+`nvidia/Qwen3.8-Flash-Next-FP4-Local`. Two things it does notably better than both vLLM lanes here:
+
+| | vLLM (either lane) | Flare 47581cc, TP1, MTP 5 |
+|---|---:|---:|
+| Cold start to serving (weights warm on disk) | about 9 minutes | **21 seconds** |
+| KV cache in the 27-31 GB budget | 1,575,180 (default) / 1,751,020 (vllm-0.32) | **2,019,328** (~7.7 full 262k requests) |
+
+Its prefill on the synthetic 8k/16k/32k ladder is 2,370 t/s, below both vLLM lanes. A full comparison
+(decode, context ladder, tool-eval, sixcat) is being measured.
+
 ### Earlier: TensorFold INT4 on an older image
 
 <details>
