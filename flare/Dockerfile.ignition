@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+# Flare preparation image for DGX Spark (SM121): Ignition with its locked environment
+# (PyTorch, Transformers, local-inference-lab FlashInfer/b12x, the Heliopause extension) on the
+# NGC PyTorch base, which supplies the CUDA toolkit, nvcc and CUPTI that preparation needs.
+# Built here with `git archive` of Flare 47581cc as the build context and this file copied into it:
+#   docker build -f Dockerfile.ignition --build-arg FLARE_COMMIT=47581ccac82660953a5b59cb04b2750d64edc97d -t flare-ignition:47581cc .
+# The README's Flare section has the export command; io_uring needs --security-opt seccomp=unconfined, and
+# --output must sit on the same filesystem as the mounted ~/.cache/flare.
+FROM nvcr.io/nvidia/pytorch:26.07-py3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build pkg-config protobuf-compiler libssl-dev python3-dev liburing-dev curl git \
+ && rm -rf /var/lib/apt/lists/*
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1 \
+    CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup CUDA_HOME=/usr/local/cuda
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+ && curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+ENV PATH=/opt/flare/.venv/bin:/opt/cargo/bin:/usr/local/cuda/bin:$PATH
+WORKDIR /opt/flare
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --extra prepare
+ARG FLARE_COMMIT
+LABEL io.github.flare-local-inference.commit=$FLARE_COMMIT
+ENTRYPOINT ["ignition"]
+CMD ["--help"]
