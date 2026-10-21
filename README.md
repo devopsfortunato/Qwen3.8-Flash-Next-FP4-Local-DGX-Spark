@@ -367,10 +367,10 @@ off, temperature 0. Flare means Flare with the [MXFP8 LM head](#the-mxfp8-lm-hea
 | Perplexity checks | yes | yes | no prompt logprobs |
 | KV cache, tokens | 1,575,180 | 1,751,020 | **2,007,040** |
 | Start to serving | 233-245 s | 498 s | **21-24 s** |
-| 128k follow-up: the next chat turn | **0.65 s** | 1.38 s | 0.91 s |
-| 128k follow-up: a new question in the same user message | 4.0 s | **1.35 s** | 60.6 s |
+| 128k: next question in the same chat (history sent) | **0.65 s** | 1.38 s | 0.91 s |
+| 128k: same document re-sent with a new question | 4.0 s | **1.35 s** | 60.6 s |
 | Maintenance | pinned eugr nightly | 21 patches over v0.32.0 | 29-line patch, 17-24 min re-export per update |
-| **Use it for** | **the default** | prefill, many users, long documents in one message | fast restarts, one user, long-context decode, most KV |
+| **Use it for** | **the default** | prefill, many users, documents re-sent with each question | fast restarts, one user, long-context decode, most KV |
 
 Decode and prefill medians are over llm_context_benchmarks' 0.5k, 8k, 32k and 128k (mean of 2 runs per size),
 and the first peak is the best of those sizes. The second peak is the best 10-second window of a 3,000-token
@@ -379,13 +379,13 @@ at once, and eight 8k-token documents with unique first lines; C=8 prefill is al
 until the last first token. Follow-ups are from [Prefix cache](#prefix-cache).
 
 - **The default stays.** It has the best task scores, the only quality also checked by perplexity, level decode,
-  follow-ups under a second at message boundaries and partial reuse inside a message (4.0 s at 128k). It costs a
-  4-minute start and the smallest KV pool.
-- **vllm-0.32 is the fastest for prefill** (+10-11% on the medians), **with 8 streams** (128 t/s) and for a new
-  question inside a long user message (1.35 s at 128k). Its tool-eval runs (87-88) keep it opt-in.
+  the next question in a chat under a second, and partial reuse when a document is re-sent with a new question
+  (4.0 s at 128k). It costs a 4-minute start and the smallest KV pool.
+- **vllm-0.32 is the fastest for prefill** (+10-11% on the medians), **with 8 streams** (128 t/s) and when a long
+  document is re-sent with a new question (1.35 s at 128k). Its tool-eval runs (87-88) keep it opt-in.
 - **Flare with the MXFP8 head starts in 21-24 s, holds 27% more KV and decodes fastest for one user**, most on
-  prose and long contexts. With 8 streams it is the slowest (97 t/s), it reuses nothing inside a message, its
-  sixcat is 1.9 points under the default, and it needs a local patch.
+  prose and long contexts. With 8 streams it is the slowest (97 t/s), it reuses nothing when a document is
+  re-sent with a new question, its sixcat is 1.9 points under the default, and it needs a local patch.
 - **Peak decode depends on what is being written.** [myllmbox's recipe](https://github.com/myllmbox/qwen38-flash-next-recipe)
   reports 82.3 t/s as its best 10-second window while a request writes code, with drafts up to 7 deep and
   thinking on; measured the same way with thinking off, these three give 59-65 t/s with 3 drafts. Its
@@ -705,31 +705,32 @@ request on a fresh document (an llm_context_benchmarks prose file behind a uniqu
 follow-up. Reused tokens are what each server reports: vLLM's prefix-cache hit counter, Flare's
 `cached_tokens`. Flare ran with 3 drafts, fixed width; vllm-0.32 is in the last bullet. Flare with the MXFP8 head
 measured the same: within 0.06 s of the stock times below whenever it reused a prefix, and again nothing reused
-inside a message.
+when the document was re-sent with a new question.
 
 | Time to first token, s | Default 8k | Default 32k | Default 128k | Flare 8k | Flare 32k | Flare 128k |
 |---|---:|---:|---:|---:|---:|---:|
 | Cold, mean of the four cold requests | 4.03 | 15.06 | 62.06 | 4.06 | 15.19 | 62.27 |
 | The same request again | 0.08 | 0.14 | 0.45 | 0.03 | 0.08 | 0.39 |
 | Document in the system message, a new question | 0.24 | 0.30 | 0.63 | 0.21 | 0.27 | 0.55 |
-| The next turn: first question, its answer, a new question | 0.25 | 0.31 | 0.65 | 0.30 | 0.39 | 0.85 |
-| Document and question in one user message, a new question | 2.12 | 3.87 | 4.02 | 3.98 | 15.18 | 62.30 |
+| Next question in the same chat: first question, its answer, a new question | 0.25 | 0.31 | 0.65 | 0.30 | 0.39 | 0.85 |
+| Same document re-sent with a new question: document and question in one user message, no history | 2.12 | 3.87 | 4.02 | 3.98 | 15.18 | 62.30 |
 
-- **At message boundaries both reuse everything shared.** Only the new question, 24-28 tokens, is computed, and
-  a 128k follow-up starts in 0.55-0.85 s instead of 62 s. Flare is faster on a repeat and a new question, the
-  default on the next turn.
-- **Inside a message Flare reuses nothing.** Flare keeps states only at instruction, prompt and answer
-  boundaries ([its design](https://github.com/NVIDIA/flare-local-inference/blob/main/docs/cli-design.md)), so a
-  new question after a document in the same user message reuses nothing and pays the full prefill again, 62 s
-  at 128k. The default resumes from the last GDN state it kept inside the document (4,096, 24,576 and 122,880
-  tokens in) and recomputes the rest: 2.1, 3.9 and 4.0 s. For reuse on both, send long documents as the system
-  message.
+- **The next question in a chat is always reused.** A client that sends the history shares everything up to the
+  previous answer, where every engine keeps a state. Only the new question, 24-28 tokens, is computed, and a 128k
+  follow-up starts in 0.55-0.85 s instead of 62 s. Flare is faster on a repeat and a new question after a system
+  message, the default on the next question in a chat.
+- **A document re-sent with a new question gets nothing back on Flare.** The two requests share only the
+  document, and it ends inside the user message. Flare keeps states only at instruction, prompt and answer
+  boundaries ([its design](https://github.com/NVIDIA/flare-local-inference/blob/main/docs/cli-design.md)), so it
+  has no state there and pays the full prefill again, 62 s at 128k. The default resumes from the last GDN state
+  it kept inside the document (4,096, 24,576 and 122,880 tokens in) and recomputes the rest: 2.1, 3.9 and 4.0 s.
+  For reuse on both, send a document that comes back with each question as the system message.
 - **A cached answer can differ.** At temperature 0 the repeated request answered differently from the cold one
   on Flare at all three sizes (from character 27-95), with the MXFP8 head too, on the default at 8k
   (character 159) and on vllm-0.32 at 128k. Three samples each.
 - **vllm-0.32 reuses the same amount whatever the layout.** Every follow-up reused exactly 6,400, 32,000 and
   128,000 tokens and started in 0.9, 0.6 and 1.4 s at 8k, 32k and 128k: slower than the default on a repeat or
-  the next turn (0.45-0.65 s at 128k), faster when the new question sits in the same user message (1.35 s
+  the next question in a chat (0.45-0.65 s at 128k), faster when a document is re-sent with a new question (1.35 s
   against 4.0 s).
 
 ### Earlier: TensorFold INT4 on an older image
