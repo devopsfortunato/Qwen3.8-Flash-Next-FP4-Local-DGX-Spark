@@ -169,16 +169,44 @@ from patches 1–18, before the final rebuild from the full series:
 | + 19 + 20 (the profile) | 2,633 | 45.45 | 1,751,020 | 1.0872 / 2.2090 / 1.0454 | 0.043 / 98.44% (own repeat noise 0.050) |
 | + 19 + 20 + 21 `--use-replayssm` | 2,586 | 45.75 | 1,955,533 | — | 0.042 / 98.49% |
 
-Quality on patches 1–18 (before 19/20): tool-eval-bench 2.8.1 89 · 88
-(pinned 89 · 90), sixcat-eval 0.8.3 90.7 (pinned 92.1; the gap is Tools,
-2 of 20 items, which varies by 10 points between runs of one config).
+**The image built from this series** (`qwen38-flash-next-fp4:vllm-0.32.0-ffc95be46c72`, `PROFILE=vllm-0.32`):
+prefill 2,596 t/s, decode 45.23 t/s, 1,751,020 KV tokens, perplexity 1.0877 / 2.2158 / 1.0444, against the
+pinned image 0.042 mean |Δlogprob| and 98.49% top-1 agreement (own repeat noise 0.048).
+
+| quality | pinned image | this lane, MXFP8 LM head | this lane, BF16 LM head |
+|---|---|---|---|
+| tool-eval-bench 2.8.1, 97 scenarios (points) | 89 · 90 (172 · 175) | 88 · 87 (171 · 169) | 88 · 87 (170 · 169) |
+| sixcat-eval 0.8.3, 884 items | 92.1 | 90.3 · 90.8 | — |
+
+Prompts are not the cause: eight tool-calling conversations (tool results, parallel calls, reasoning history,
+thinking on and off) render to identical token ids through `/tokenize` on both images, and the tool parser
+is the same file. The failing scenarios move with the numerics: switching only the LM head between MXFP8 and
+BF16 makes TC-21 and TC-74 pass and TC-87 and TC-91 fail, at the same total. The sixcat gap is its Tools
+category, 2 of 20 items, on all runs of this lane. Every run of this lane scores 87-88 on tool-eval and every
+run of the pinned image 89-90: a small systematic difference cannot be excluded.
+
+llm_context_benchmarks, one request, 512 output tokens, 2 runs, same evening (prefill / decode t/s):
+
+| context | prose, pinned | prose, this lane | code, pinned | code, this lane |
+|---|---|---|---|---|
+| 0.5k | 1,057 / 46.4 | **1,252** / 47.5 | 1,073 / 57.0 | **1,279** / 54.0 |
+| 8k | 2,086 / 42.4 | **2,343** / 41.7 | 2,078 / 56.3 | **2,371** / 55.6 |
+| 32k | 2,174 / 41.3 | **2,373** / 39.9 | 2,187 / 51.3 | **2,414** / 58.0 |
+| 128k | 2,100 / 39.2 | **2,247** / 39.7 | 2,138 / 46.3 | **2,322** / 45.2 |
+
+Code decode depends on how long each answer runs (166 to 512 tokens), so those cells are noisy.
+
+Quality on patches 1–18 (before 19/20): tool-eval-bench 89 · 88, sixcat-eval 90.7.
 
 Tried on this lane and left out (no gain at one stream, output unchanged):
 Marlin MoE (39.78 t/s), `FULL_AND_PIECEWISE` CUDA graphs (39.99),
 `--async-scheduling` (38.88), `--max-num-batched-tokens 8192` (39.33), all on
 patches 1–19. Turning off upstream's QSA prepare fusion and merged QSA
 projections leaves prefill at 2,599 t/s and costs decode (37.42), so they are
-not where this lane's prefill lead comes from.
+not where this lane's prefill lead comes from. Neither are the GDN prefill
+kernel, the fork's FP4 prefill activations or its PLE queue depth (512 and
+1024 give 2,398 and 2,409 t/s on the pinned image); the PLE table in memory
+does not fit on either image next to the weights.
 
 Source checks (x86): the series replays onto a fresh
 `git clone --depth 1 --branch v0.32.0` with `git am` and reproduces tree
