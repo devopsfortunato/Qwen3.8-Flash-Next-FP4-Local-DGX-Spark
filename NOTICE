@@ -35,6 +35,14 @@ FlashInfer
   The only change makes DiskTable's default io_uring queue depth read PLE_QUEUE_DEPTH (256 when unset)
   instead of the fixed 64.
 
+NVIDIA Flare (flare-local-inference)
+  https://github.com/NVIDIA/flare-local-inference
+  Apache License, Version 2.0.
+  flare/qwen38-mxfp8-lm-head.patch modifies ignition/recipes/qwen38/bootstrap.py, decoder.py and
+  decoder_state.py at commit 47581cc: with QWEN38_LM_HEAD=mxfp8 the LM head is also stored as MXFP8 and computes
+  the target logits. flare/Dockerfile.ignition builds Flare's own source on nvcr.io/nvidia/pytorch:26.07-py3.
+  This repository does not vendor Flare.
+
 NVIDIA Qwen3.8-Flash-Next-FP4-Local
   https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local
   Quantized by NVIDIA with Model Optimizer. Governing download terms: NVIDIA Open Model Agreement.

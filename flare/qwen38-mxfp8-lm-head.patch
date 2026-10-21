@@ -1,0 +1,102 @@
+diff --git a/ignition/recipes/qwen38/bootstrap.py b/ignition/recipes/qwen38/bootstrap.py
+index 5c5d371..a9b48b8 100644
+--- a/ignition/recipes/qwen38/bootstrap.py
++++ b/ignition/recipes/qwen38/bootstrap.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import contextlib
+ import hashlib
+ import json
++import os
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
+@@ -246,6 +247,13 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
+     if package_storage is not None:
+         transient.enter_context(package_storage.transient())
+     weights = ModelWeights.load(manifest, device, progress=progress, shard=shard)
++    lm_head_format = os.environ.get("QWEN38_LM_HEAD", "bf16")
++    if lm_head_format not in ("bf16", "mxfp8"):
++        raise ValueError(f"QWEN38_LM_HEAD must be bf16 or mxfp8, not {lm_head_format!r}")
++    if lm_head_format == "mxfp8" and shard.world_size == 1:
++        from ignition.components.weights import quantize_bf16_linear_as_mxfp8
++
++        weights.tree.lm_head.mxfp8_weight = quantize_bf16_linear_as_mxfp8(weights.tree.lm_head.weight)
+     if torch.cuda.get_device_properties(device).is_integrated:
+         from ignition.preparation.host_memory import release_page_cache
+ 
+@@ -440,11 +448,14 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
+                                   *(("draft_page_tables",) if enabled and has_mtp else ()))
+                 for capacity in reversed(config.batch_capacities):
+                     name = f"resume{capacity}" + suffix
++                    resume_head = getattr(weights.tree.lm_head, "mxfp8_weight", None)
+                     resume = PreparedResume(inputs, requests, state, scratch.sample_hidden[:capacity],
+-                        scratch.logits[:capacity], weights.tree.lm_head.weight, completion, frame, sequence,
++                        scratch.logits[:capacity], weights.tree.lm_head.weight if resume_head is None else resume_head,
++                        completion, frame, sequence,
+                         session=session, name=name, vocabulary_runtime=vocabulary_collective,
+                         local_logits=None if scratch.local_logits is None else scratch.local_logits[:capacity],
+-                        coordinator=coordinator, sampling_workspace=sampling_workspace)
++                        coordinator=coordinator, sampling_workspace=sampling_workspace,
++                        projection_workspace=workspaces)
+                     forward = speculation.resume(resume) if enabled else resume
+                     add(name, forward, "resume", capacity, 1, forward_fields, enabled=enabled)
+                     owners.append(resume)
+diff --git a/ignition/recipes/qwen38/decoder.py b/ignition/recipes/qwen38/decoder.py
+index 18cae05..30860dc 100644
+--- a/ignition/recipes/qwen38/decoder.py
++++ b/ignition/recipes/qwen38/decoder.py
+@@ -210,7 +210,7 @@ class PreparedDecoder:
+                  gdn_records=None, gdn_in_place: bool = False, runtime=None, vocabulary_runtime=None, coordinator=None,
+                  sampling_workspace=None):
+         from ignition.components.embedding import PreparedEmbedding
+-        from ignition.components.linear import UnquantizedProjection
++        from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+ 
+         from .attention import PreparedAttention
+         from ignition.components.gated_delta import PreparedGDN
+@@ -287,8 +287,14 @@ class PreparedDecoder:
+         state.prepare_hidden(scratch.hidden, scratch.sample_hidden)
+         state.prepare_residual(scratch.residual)
+         if vocabulary_runtime is None:
+-            self.lm_head = UnquantizedProjection(scratch.sample_hidden, weights.tree.lm_head.weight,
+-                scratch.logits, session=session, name=f"{name}.lm_head")
++            # QWEN38_LM_HEAD=mxfp8 (bootstrap) attaches an MXFP8 copy; verification then reads half the bytes.
++            mxfp8_head = getattr(weights.tree.lm_head, "mxfp8_weight", None)
++            if mxfp8_head is None:
++                self.lm_head = UnquantizedProjection(scratch.sample_hidden, weights.tree.lm_head.weight,
++                    scratch.logits, session=session, name=f"{name}.lm_head")
++            else:
++                self.lm_head = QuantizedProjection(scratch.sample_hidden, mxfp8_head, scratch.logits,
++                    session=session, name=f"{name}.lm_head", activation_mode="a16", workspace=workspaces)
+         else:
+             from ignition.components.vocabulary import PreparedVocabularyProjection
+ 
+diff --git a/ignition/recipes/qwen38/decoder_state.py b/ignition/recipes/qwen38/decoder_state.py
+index 355a454..92cf3d7 100644
+--- a/ignition/recipes/qwen38/decoder_state.py
++++ b/ignition/recipes/qwen38/decoder_state.py
+@@ -296,8 +296,9 @@ class PreparedResume:
+ 
+     def __init__(self, inputs, requests, pool, sample_hidden, logits, lm_head_weight,
+                  completion, frame_index, submission_sequence, *, session, name,
+-                 local_logits=None, vocabulary_runtime=None, coordinator=None, sampling_workspace=None):
+-        from ignition.components.linear import UnquantizedProjection
++                 local_logits=None, vocabulary_runtime=None, coordinator=None, sampling_workspace=None,
++                 projection_workspace=None):
++        from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+         from ignition.components.sampling import PreparedSampling
+ 
+         rows = sample_hidden.shape[0]
+@@ -309,8 +310,11 @@ class PreparedResume:
+              requests.pending_token, inputs.request_state_rows, pool.last_hidden.stride(0), requests.consumed_tokens.stride(0), 4096, requests.capacity),
+             (rows, 1, 1))
+         self.sample_hidden = sample_hidden
+-        if vocabulary_runtime is None:
++        if vocabulary_runtime is None and isinstance(lm_head_weight, torch.Tensor):
+             self.projection = UnquantizedProjection(sample_hidden, lm_head_weight, logits, session=session, name=name)
++        elif vocabulary_runtime is None:
++            self.projection = QuantizedProjection(sample_hidden, lm_head_weight, logits, session=session, name=name,
++                                                  activation_mode="a16", workspace=projection_workspace)
+         else:
+             from ignition.components.vocabulary import PreparedVocabularyProjection
+ 

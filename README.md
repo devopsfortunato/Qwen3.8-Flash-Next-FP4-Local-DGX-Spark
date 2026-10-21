@@ -28,6 +28,10 @@ command: `VLLM_PLE_TABLE_MEMORY=disk` and a 262,144-token window.
 > 2,114 t/s, decode 39 t/s, TTFT 62 s. 1,575,180 tokens of FP8 KV cache: six full 262k requests at once, up to
 > 8 decoded together. sixcat 92.1, tool-eval 89/100. See [Benchmarks](#benchmarks).
 
+NVIDIA's [Flare](https://github.com/NVIDIA/flare-local-inference) engine serves the same weights; see
+[Flare](#flare-nvidias-new-engine) for how it compares: start time, KV room, decode with an MXFP8 LM head, task
+scores, and prefix reuse.
+
 ## Quick start
 
 ```bash
@@ -493,21 +497,69 @@ at a time, 512 output tokens, mean of 2 runs per size. Speculative decoding as e
 
 ![Speed by context length](docs/four-speed.png)
 
-### Flare (NVIDIA's new engine, first look)
+### Flare (NVIDIA's new engine)
 
 [flare-local-inference](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0, first published 2026-10-20)
-also serves this checkpoint — its pinned recipe
-`local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD` carries byte-identical weights to
-`nvidia/Qwen3.8-Flash-Next-FP4-Local`. Measured at `47581cc`, TP1, on the same Spark, thinking off and
-temperature 0. Two things it does notably better than both vLLM lanes here:
+serves this checkpoint too: its pinned recipe `local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD`
+carries byte-identical weights to `nvidia/Qwen3.8-Flash-Next-FP4-Local`. Flare compiles the model once into a
+package (`ignition export`) and serves that package from a small Rust runtime (`flare run`). Measured at
+`47581cc`, one GPU, 3 drafts with fixed-width verification (see [Decode settings](#flare-decode-settings)), on the
+same Spark, thinking off, temperature 0. "+ MXFP8 head" is Flare with
+[`flare/qwen38-mxfp8-lm-head.patch`](flare/qwen38-mxfp8-lm-head.patch) (see
+[The MXFP8 LM head](#the-mxfp8-lm-head)).
 
-| | vLLM | Flare |
-|---|---:|---:|
-| Start to serving, weights and compiled kernels already on disk | 242 s (default) | **21 s** |
-| KV cache, tokens | 1,575,180 (default) / 1,751,020 (vllm-0.32) | **2,019,328** (~7.7 full 262k requests) |
+| | Default | vllm-0.32 | Flare | Flare + MXFP8 head |
+|---|---:|---:|---:|---:|
+| Start to serving, page cache dropped | 233 s | – | – | **23.5 s** |
+| Start to serving, warm | 242 · 245 s | – | 21.3-22.6 s (4 starts, logged steps) | **21.4 · 21.4 s** |
+| KV cache, tokens | 1,575,180 | 1,751,020 | **2.02-2.07M** | 2,007,040 |
+| Decode step, 3 drafts | 60.0-60.7 ms | 59.3-60.3 ms | 58.8-59.5 ms | **55.7-56.2 ms** |
+| Decode, 512 tokens (geomean of 3 prompts) | **45.58** | 45.23 | 44.77 | 45.40 |
+| Decode by context (geomean of 8 below) | 47.1 | 47.2 | 47.1 | **51.1** |
+| Prefill by context (geomean of 8 below) | 1,789 | **2,009** | 1,795 | 1,810 |
+| Prefill, synthetic 8k / 16k / 32k (geomean) | 2,411 | **2,596** | 2,383 | – |
+| tool-eval-bench 2.8.1 | **89 · 90** | 88 · 87 | 88 · 89 · 86 · 90 | 88 · 89 |
+| sixcat-eval 0.8.3, 884 items | **92.1** | 90.6 (mean of 2) | 89.5 | 90.2 |
+| Perplexity | measured | measured | no prompt logprobs | no prompt logprobs |
 
-**Decode depends on two `flare run` flags.** The package was exported once with 5 draft tokens and keeps every
-smaller width, so each setting below is one 30-second restart:
+| t/s by context | Default | vllm-0.32 | Flare | Flare + MXFP8 head |
+|---|---:|---:|---:|---:|
+| Decode, prose 0.5k / 8k / 32k / 128k | 46.4 / 42.4 / 41.3 / 39.2 | 47.5 / 41.7 / 39.9 / 39.7 | 49.9 / 42.3 / 41.7 / 43.5 | 56.5 / 48.4 / 45.0 / 44.1 |
+| Decode, code 0.5k / 8k / 32k / 128k | 57.0 / 56.3 / 51.3 / 46.3 | 54.0 / 55.6 / 58.0 / 45.2 | 53.7 / 52.4 / 46.3 / 48.6 | 55.3 / 58.9 / 57.0 / 46.4 |
+| Prefill, prose 0.5k / 8k / 32k / 128k | 1,057 / 2,086 / 2,174 / 2,100 | 1,252 / 2,343 / 2,373 / 2,247 | 1,141 / 1,995 / 2,194 / 2,106 | 1,150 / 1,999 / 2,137 / 2,127 |
+| Prefill, code 0.5k / 8k / 32k / 128k | 1,073 / 2,078 / 2,187 / 2,138 | 1,279 / 2,371 / 2,414 / 2,322 | 920 / 2,180 / 2,260 / 2,266 | 942 / 2,192 / 2,317 / 2,300 |
+
+By context: [llm_context_benchmarks](https://github.com/ivanfioravanti/llm_context_benchmarks), 512 output tokens,
+mean of 2 runs per size; the default and vllm-0.32 ran it on 2026-10-20, Flare on 2026-10-21. The 512-token
+decode is 3 runs per prompt on vLLM and 5 on Flare. Starts are timed from `docker run` to the first `/v1/models`
+answer, with the weights and compiled kernels already on disk; "page cache dropped" empties the OS cache first.
+
+- **Flare starts in seconds.** 21-24 s to serve, against about 4 minutes for vLLM (233-245 s), which loads the
+  checkpoint, builds the model and captures its graphs on every start; dropping the page cache first changes
+  neither much. Flare does that work once, in an export of 17-24
+  minutes that writes a 108 GB package. Of its 21 s, 14.5 s read the 72.4 GiB of weights.
+- **Flare holds more KV:** about 2.0M tokens, 7.7 full 262k windows, against 1.58M and 6 for the default.
+- **Decode is level stock and ahead with the MXFP8 head.** Flare's step is already a little shorter than vLLM's
+  (59 ms against 60), and the MXFP8 head takes it to 56 ms. Flare's text changes from run to run (see below),
+  which moves one run's speed by up to 10%, so the step time is the steadier measure: about 5% faster than the
+  default. The context benchmark shows 51.1 against 47.1 t/s; the 512-token benchmark 45.4 against 45.6.
+- **Prefill is level with the default** and behind vllm-0.32 at every size (2-28%, 11% on the geomean).
+- **tool-eval is level; sixcat is lower.** Stock Flare's four tool-eval runs average 88.3 (the default's two,
+  89.5) and spread 86-90; its second run had 5 safety-critical failures (3 in each other run and on the
+  default), which caps that run's rating at Adequate. sixcat is 89.5 against 92.1, most of it Truth (83 against
+  89) and Tools (85 against 90, one item of 20); Instruct 88 against 91, Code 93.9 against 96.3, Math 98 on both,
+  Knowledge 89.3 against 88.2. With the MXFP8 head, tool-eval scored 88 and 89 (3 safety-critical failures each)
+  and sixcat 90.2 (Truth 86, Code 95.7, Knowledge 89.8, Math 97, Instruct 88, Tools 85): no worse than stock
+  Flare on either, one sixcat run each. The gap to the default stays in Truth, Instruct and Tools.
+- **Neither engine repeats itself exactly at temperature 0, Flare least.** Over 3 runs the default gave the same
+  text on 2 of its 3 decode prompts and vllm-0.32 on none; over 5 runs Flare gave 5 different texts for every
+  prompt. Flare's texts part early enough to move decode speed by up to 10% between runs, vLLM's by about 3%.
+- **Flare has no prompt logprobs** (`echo` with `logprobs` answers HTTP 400), so it has no perplexity here.
+
+#### Flare decode settings
+
+The package was exported with 5 draft tokens and keeps every smaller width, so each `flare run` setting below
+is one 30-second restart (3 runs per prompt):
 
 | `flare run` setting | Decode t/s, 512 tokens (geomean) |
 |---|---:|
@@ -518,46 +570,77 @@ smaller width, so each setting below is one 30-second restart:
 | 4 drafts, fixed width | 43.10 |
 | **3 drafts, fixed width** | **43.55** |
 
-The rest of this section uses 3 drafts with fixed width. On the default, Flare scored 85 on one tool-eval run.
-`--embedding-table-storage ram` (the n-gram table in memory instead of on NVMe) did not start serving within
-two minutes and was not pursued.
+Measured again with 5 runs per prompt, 3 drafts with fixed width gave 44.77. On Flare's default, one tool-eval
+run scored 85. Two runtime options left the step time where it was (58.1-59.5 ms) and the speed within run
+noise: `--embedding-table-cache-size 4G`, a RAM cache for hot rows of the n-gram table, 45.30, and
+`--embedding-table-resident-scales` with it, 45.25. The n-gram table reads are not what decode waits on.
+4 drafts with fixed width and the cache gave 45.47: more tokens accepted per step, 65 ms steps.
+`--embedding-table-storage ram` (the whole table in memory) did not start serving within two minutes.
 
-| | Default | vllm-0.32 | Flare |
-|---|---:|---:|---:|
-| Decode, 512 tokens (geomean) | **45.58** | 45.23 | 43.55 |
-| Decode, prose 0.5k / 8k / 32k / 128k | 46.4 / 42.4 / 41.3 / 39.2 | 47.5 / 41.7 / 39.9 / 39.7 | 49.9 / 42.3 / 41.7 / 43.5 |
-| Decode, code 0.5k / 8k / 32k / 128k | 57.0 / 56.3 / 51.3 / 46.3 | 54.0 / 55.6 / 58.0 / 45.2 | 53.7 / 52.4 / 46.3 / 48.6 |
-| Prefill, synthetic 8k / 16k / 32k (geomean) | 2,411 | **2,596** | 2,383 |
-| Prefill, prose 0.5k / 8k / 32k / 128k | 1,057 / 2,086 / 2,174 / 2,100 | 1,252 / 2,343 / 2,373 / 2,247 | 1,141 / 1,995 / 2,194 / 2,106 |
-| Prefill, code 0.5k / 8k / 32k / 128k | 1,073 / 2,078 / 2,187 / 2,138 | 1,279 / 2,371 / 2,414 / 2,322 | 920 / 2,180 / 2,260 / 2,266 |
-| tool-eval-bench 2.8.1 | **89 · 90** | 88 · 87 | 88 · 89 · 86 · 90 |
-| sixcat-eval 0.8.3, 884 items | **92.1** | 90.6 (mean of 2 runs) | 89.5 |
+Drafts are accepted as often as on vLLM: at depths 1, 2 and 3, 75%, 53% and 36% of rounds on Flare against 73%,
+48% and 32% on the default, over the same three prompts.
 
-By context: [llm_context_benchmarks](https://github.com/ivanfioravanti/llm_context_benchmarks), 512 output tokens,
-mean of 2 runs; the default and vllm-0.32 ran it on 2026-10-20.
+#### The MXFP8 LM head
 
-- **Decode is close.** 4% behind the default over 512 tokens, ahead at 128k (43.5 against 39.2 on prose, 48.6
-  against 46.3 on code), behind on code up to 32k (46.3-53.7 against 51.3-57.0).
-- **Prefill is level with the default** (-14% to +8% by size, -1% on the synthetic ladder) and behind vllm-0.32
-  at every size.
-- **tool-eval is level.** Four runs average 88.3 (the default's two, 89.5), and they spread 86-90. The second
-  run had 5 safety-critical failures (3 in each other run, and on the default), which caps that run's rating at
-  Adequate. Perplexity cannot be measured: Flare does not return prompt logprobs.
-- **sixcat is lower.** 89.5 against 92.1, most of it Truth (83 against 89) and Tools (85 against 90, one item
-  of 20); Instruct 88 against 91, Code 93.9 against 96.3, Math 98 on both, Knowledge 89.3 against 88.2.
+On one GPU, Flare's Qwen recipe computes the LM head (248,320 x 2,560) in BF16: 1.27 GB read on every decode
+step. This recipe's vLLM reads it as MXFP8, 0.65 GB (`VLLM_MXFP8_LM_HEAD=1`); on vLLM the BF16 head costs 6% of
+decode and is no closer to the reference (mean |Δ logprob| 0.039 either way, see [Precision](#precision)).
+Flare's drafts already read an NVFP4 copy of the head; its verification keeps BF16 by design.
 
-How it ran here, as two Docker images built on the Spark:
+[`flare/qwen38-mxfp8-lm-head.patch`](flare/qwen38-mxfp8-lm-head.patch) (29 added lines, against `47581cc`) makes an
+MXFP8 copy of the head at load when `QWEN38_LM_HEAD=mxfp8` is set, and computes every target logit with it:
+prefill, verification, and sampling after a prefix-cache restore. Unset, the recipe is unchanged. The decode
+step went from 58.8-59.5 ms to 55.7-56.2 ms; drafts are accepted as often as before (76%, 54% and 37% at depths
+1-3); prefill and prefix-cache behaviour are unchanged. The BF16 head stays loaded beside the copy, which costs
+the KV pool about 44k tokens (2,007,040; stock boots gave 2.02-2.07M, moving with free memory). The patch hands
+the decoder's scratch arena to both MXFP8 projections; without it the export crashed with an illegal
+instruction.
 
-- `flare:47581cc`, 125 MB, from Flare's own `Dockerfile`: serving only.
-- `flare-ignition:47581cc`, 33.7 GB: `nvcr.io/nvidia/pytorch:26.07-py3` plus Flare's
-  `uv sync --locked --extra prepare`, for `ignition export qwen3.8-flash --gpus 0 --mtp-draft-tokens 5
-  --max-concurrency 8`. Both containers need `--security-opt seccomp=unconfined` (io_uring is blocked
-  otherwise), and the export's `--output` must be on the same filesystem as `~/.cache/flare`: the package
-  hard-links cached blobs, and a cross-device output fails at publish. The export took about 17 minutes; the
-  package is 107 GB, stored once through the hard links.
-- Serving: `flare run PACKAGE --gpus 0 --mtp-draft-tokens 3 --no-mtp-adaptive-verification
-  --served-model-name nvidia/Qwen3.8-Flash-Next-FP4-Local`, approving the development publisher key the export
-  generated (`--publisher-keys`, `--dangerously-approve-key`, `--dangerously-accept-publisher local-development`).
+#### Running Flare
+
+Two Docker images, built on the Spark:
+
+- `flare:47581cc`, 125 MB: Flare's own `Dockerfile`, serving only. It runs as user 10001.
+- `flare-ignition:47581cc`, 33.7 GB: [`flare/Dockerfile.ignition`](flare/Dockerfile.ignition), Flare's
+  `uv sync --locked --extra prepare` on `nvcr.io/nvidia/pytorch:26.07-py3` (CUDA toolkit, nvcc and CUPTI), for
+  `ignition export`.
+
+Export once, 17-24 minutes. The package hard-links the blobs it caches in `~/.cache/flare`, so `--output` must
+be on that filesystem (elsewhere the publish step fails with a cross-device link); io_uring needs
+`--security-opt seccomp=unconfined`. Plan for about 190 GB free: besides the 108 GB package, an export leaves
+about 80 GB of blobs no package links to (link count 1 in `~/.cache/flare/packages/blobs`), safe to delete
+afterwards. Flare downloads its own recipe's checkpoint; its weight files are the same bytes as NVIDIA's, so
+hard-linking them into the Hugging Face cache under the other name saves a second 96 GB download.
+
+```bash
+mkdir -p "$HOME/.cache/flare/runtime/qwen38"
+docker run --rm --gpus all --ipc host --network host --ulimit memlock=-1 --ulimit stack=67108864 \
+  --security-opt seccomp=unconfined -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -v "$HOME/.cache/flare:/root/.cache/flare" -v "$HOME/.config/flare:/root/.config/flare" \
+  flare-ignition:47581cc export qwen3.8-flash --gpus 0 --mtp-draft-tokens 5 --max-concurrency 8 \
+  --output /root/.cache/flare/runtime/qwen38/qwen38
+```
+
+For the MXFP8 head, add `-e QWEN38_LM_HEAD=mxfp8` and the patch: apply it to the Flare checkout before
+building `flare-ignition`, or mount the three patched files over `/opt/flare/ignition/recipes/qwen38/` (how it
+ran here).
+
+The export signs the package with a development key it creates in `~/.config/flare`, as root and readable only
+by root, like the package files. The serving image runs as user 10001, so make them readable
+(`chmod a+r ~/.config/flare/development-publisher.json` and `chmod -R a+rX ~/.cache/flare`, as root), then:
+
+```bash
+FP=$(python3 -c 'import hashlib, json, os; p = os.path.expanduser("~/.config/flare/development-publisher.json"); print(hashlib.sha256(bytes(json.load(open(p))[0]["public_key"])).hexdigest())')
+docker run -d --name flare-qwen38 --gpus all --ipc host --network host --ulimit memlock=-1 \
+  --ulimit stack=67108864 --security-opt seccomp=unconfined \
+  -v "$HOME/.cache/flare:/home/flare/.cache/flare:ro" \
+  -v "$HOME/.config/flare/development-publisher.json:/keys/dev-publisher.json:ro" \
+  flare:47581cc run /home/flare/.cache/flare/runtime/qwen38/qwen38.safetensors --gpus 0 --host 0.0.0.0 \
+  --port 8000 --served-model-name nvidia/Qwen3.8-Flash-Next-FP4-Local \
+  --mtp-draft-tokens 3 --no-mtp-adaptive-verification \
+  --publisher-keys /keys/dev-publisher.json --dangerously-approve-key "$FP" \
+  --dangerously-accept-publisher local-development --offline --trust-store /tmp/trust.toml
+```
 
 ### Prefix cache
 
@@ -565,7 +648,9 @@ Both servers keep finished prompts so that a later request repeating a prefix sk
 at a time, chat completions, thinking off, temperature 0, 64 output tokens. Each scenario is its own pair: a cold
 request on a fresh document (an llm_context_benchmarks prose file behind a unique first line), then the
 follow-up. Reused tokens are what each server reports: vLLM's prefix-cache hit counter, Flare's
-`cached_tokens`. vllm-0.32 was not measured; Flare ran with 3 drafts, fixed width.
+`cached_tokens`. vllm-0.32 was not measured; Flare ran with 3 drafts, fixed width. Flare with the MXFP8 head
+measured the same: within 0.06 s of the stock times below whenever it reused a prefix, and again nothing reused
+inside a message.
 
 | Time to first token, s | Default 8k | Default 32k | Default 128k | Flare 8k | Flare 32k | Flare 128k |
 |---|---:|---:|---:|---:|---:|---:|
@@ -585,13 +670,13 @@ follow-up. Reused tokens are what each server reports: vLLM's prefix-cache hit c
   tokens in) and recomputes the rest: 2.1, 3.9 and 4.0 s. For reuse on both, send long documents as the system
   message.
 - **A cached answer can differ.** At temperature 0 the repeated request answered differently from the cold one
-  on Flare at all three sizes (from character 27-95) and on the default at 8k (character 159). Three samples
-  each.
+  on Flare at all three sizes (from character 27-95), with the MXFP8 head too, and on the default at 8k
+  (character 159). Three samples each.
 
 ### Earlier: TensorFold INT4 on an older image
 
 <details>
-<summary>Measured before this round with the model card's activations (<code>PRECISION=fast</code> today), an older b12x image, tool-eval-bench 2.7.1, and TensorFold serving its INT4 checkpoint.</summary>
+<summary>Measured before this round with the model card's activations (this recipe's default today), an older b12x image, tool-eval-bench 2.7.1, and TensorFold serving its INT4 checkpoint.</summary>
 
 One GB10 (121 GB unified memory), 262,144-token window, cold prefill, 128-token decode, measured as client
 wall-clock on the same prose ladder. Each value is the peak of the recorded runs.
@@ -641,7 +726,8 @@ a second quant of the FP4-Local checkpoint.
   Changing `MAX_NUM_SEQS` rebuilds part of the kernel cache on the next start, about 5 minutes. Follow it with
   `docker logs -f qwen38-flash-next-fp4`.
 - **Unknown quantization or load format.** You are not on `eugr/spark-vllm-b12x` or the recipe image built on
-  it; upstream vLLM cannot read this checkpoint's NVFP4 scales yet. Keep the default `IMAGE`.
+  it; unpatched upstream vLLM cannot read this checkpoint's NVFP4 scales. Keep the default `IMAGE`, or build the
+  `vllm-0.32` profile's patched image with `vllm-0.32/build.sh`.
 - **`sha256 …, expected …` while building the image.** `BASE_IMAGE` ships a different PLE disk file than the
   one the queue-depth change was written for. Keep the default `BASE_IMAGE`, or serve that base as is with
   `IMAGE=<the base image>`.
@@ -667,6 +753,7 @@ profiles/                opt-in launch profiles (kv-max, 1m, vllm-0.32)
 vllm-0.32/               upstream vLLM v0.32.0 patch series, build.sh, README
 docker/                  the recipe image: Dockerfile and the PLE queue-depth build step
 docs/                    benchmark charts
+flare/                   Flare comparison: the MXFP8 LM-head patch and the preparation image's Dockerfile
 .env.example             commented overrides
 CREDITS.md               what this builds on
 NOTICE                   third-party notices
@@ -693,6 +780,8 @@ NVIDIA software and vLLM build stay under their own licenses. See `NOTICE`.
 - [vLLM](https://github.com/vllm-project/vllm) serves the model.
 - [eugr/spark-vllm-b12x](https://github.com/eugr/spark-vllm-docker) is the container.
 - b12x supplies the SM12x kernels that container loads.
+- [Flare](https://github.com/NVIDIA/flare-local-inference) (NVIDIA, Apache-2.0) is the engine compared in
+  [Flare](#flare-nvidias-new-engine); `flare/` patches its Qwen recipe and builds its preparation image.
 - [MiaAI-Lab's single-Spark TensorFold recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)
   is the layout this launcher follows. Layout only: this recipe does not run TensorFold.
 
