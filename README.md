@@ -152,6 +152,7 @@ Every setting lives in `scripts/config.sh`. Override it from the environment (`P
 | `B12X_DISK_BACKEND` | `io_uring` | how that table is read |
 | `PLE_QUEUE_DEPTH` | `256` | table reads in flight; `64` is eugr's image as shipped; the recipe image only (see [PLE queue depth](#ple-queue-depth)) |
 | `CUTE_DSL_ARCH` | `sm_121a` | GB10 architecture for the CuTe DSL kernels |
+| `CPUSET` | empty (every core) | host cores for the container; `5-9,15-19` are the GB10's 3.9 GHz Cortex-X925 cores (the rest are 2.8 GHz Cortex-A725) |
 | `HF_CACHE` | `~/.cache/huggingface` | where the checkpoint is stored |
 | `MEM_NEED_GIB` | `90` | `MemAvailable` `start.sh` asks for before launch |
 | `MEM_FLOOR_GIB` | `6` | stop the load if free memory stays below this for `MEM_FLOOR_GRACE` (30 s) |

@@ -147,6 +147,11 @@ SPARK_ENV=(
 # More container environment, as space-separated NAME=value pairs: EXTRA_ENV="B12X_FOO=1 B12X_BAR=2".
 EXTRA_ENV="${EXTRA_ENV:-}"
 
+# Host cores for the container, as `docker run --cpuset-cpus` takes them. Empty = every core. The GB10's
+# Cortex-X925 cores at 3.9 GHz are 5-9,15-19 (0-4,10-14 are 2.8 GHz Cortex-A725): CPUSET=5-9,15-19 keeps
+# vLLM's scheduler, tokenizer and sampler threads off the slow cores.
+CPUSET="${CPUSET:-}"
+
 # Remove the SPARK_ENV names a profile listed in SPARK_ENV_OMIT (fork-only
 # variables that the upstream v0.32 image must not receive).
 apply_spark_env_omit() {
@@ -351,6 +356,9 @@ validate_config() {
   if ! is_uint "${MEM_FLOOR_GRACE}"; then
     die "MEM_FLOOR_GRACE is seconds, not ${MEM_FLOOR_GRACE}"
   fi
+  if [[ -n "${CPUSET}" ]] && ! [[ "${CPUSET}" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]]; then
+    die "CPUSET is a core list like 5-9,15-19, not ${CPUSET}"
+  fi
   if ! is_uint "${MEM_HARD_FLOOR_GIB}" || (( MEM_HARD_FLOOR_GIB > MEM_FLOOR_GIB )); then
     die "MEM_HARD_FLOOR_GIB is a GiB count no higher than MEM_FLOOR_GIB, not ${MEM_HARD_FLOOR_GIB}"
   fi
@@ -398,6 +406,9 @@ build_docker_cmd() {
     --security-opt seccomp=unconfined
     --security-opt apparmor=unconfined
   )
+  if [[ -n "${CPUSET}" ]]; then
+    DOCKER_CMD+=(--cpuset-cpus "${CPUSET}")
+  fi
   for key in "${SPARK_ENV[@]}"; do
     DOCKER_CMD+=(-e "${key}=${!key}")
   done
