@@ -344,8 +344,9 @@ serves a base image as is, at queue depth 64.
 
 ### Summary: five ways to serve this checkpoint
 
-Five ways to serve this checkpoint, measured on 2026-10-20/22 on one Spark, thinking off, temperature 0. All five
-load the same weights, NVIDIA's FP4-Local at revision `b9ce18a6`; Flare `47581cc` loaded a byte-identical copy
+Five ways to serve this checkpoint, measured on 2026-10-20/22 on one Spark, thinking off, temperature 0 (Flare
+serves 0.7, its minimum: see the note under the table). All five load the same weights, NVIDIA's FP4-Local at
+revision `b9ce18a6`; Flare `47581cc` loaded a byte-identical copy
 from another repo. The LM head row says how each serves the output head: MXFP8 when the recipe quantizes the
 checkpoint's BF16 head after loading ([MXFP8 LM head](#the-mxfp8-lm-head)), BF16 when it serves it as shipped.
 
@@ -381,8 +382,11 @@ and the first peak is the best of those sizes. The second peak is the best 10-se
 single-file HTML/JS answer, 3 runs. C=1 and C=8 run 8 different prompts for 512 tokens each, one at a time or all
 at once, and eight 8k-token documents with unique first lines; C=8 prefill is all prompt tokens over the time
 until the last first token. Follow-ups are from [Prefix cache](#prefix-cache). Both Flare columns run 3 drafts at
-fixed width. myllmbox ran as shipped except its host tuning (`vm.compaction_proactiveness` stays 20 here; its
-`tune-host.sh` needs root), which its README puts at about 10% of throughput.
+fixed width, and **Flare cannot decode greedily**: it raises `temperature: 0` to the recipe's minimum, 0.7 for
+Qwen3.8, with the recipe's top-k 20 and top-p 0.95 (Flare's `docs/api.md`). Its rows, task scores included, are
+therefore sampled while the vLLM lanes are greedy. myllmbox ran as shipped except its host tuning
+(`vm.compaction_proactiveness` stays 20 here; its `tune-host.sh` needs root), which its README puts at about 10%
+of throughput.
 
 - **The default stays.** It has the best task scores (tool-eval 89 · 90, sixcat 92.1), the next question in a chat
   in 0.65 s, and partial reuse when a document is re-sent with a new question (4.0 s at 128k). It costs a
@@ -566,7 +570,7 @@ serves this checkpoint too: its pinned recipe `local-inference-lab/Qwen3.8-Flash
 carries byte-identical weights to `nvidia/Qwen3.8-Flash-Next-FP4-Local`. Flare compiles the model once into a
 package (`ignition export`) and serves that package from a small Rust runtime (`flare run`). Measured at
 `47581cc`, one GPU, 3 drafts with fixed-width verification (see [Decode settings](#flare-decode-settings)), on the
-same Spark, thinking off, temperature 0. "+ MXFP8 head" is Flare with
+same Spark, thinking off, temperature 0 requested (Flare serves 0.7, its Qwen minimum; see below). "+ MXFP8 head" is Flare with
 [`flare/qwen38-mxfp8-lm-head.patch`](flare/qwen38-mxfp8-lm-head.patch) (see
 [The MXFP8 LM head](#the-mxfp8-lm-head)).
 
@@ -616,9 +620,11 @@ answer, with the weights and compiled kernels already on disk; "page cache dropp
   Knowledge 89.3 against 88.2. With the MXFP8 head, tool-eval scored 88 and 89 (3 safety-critical failures each)
   and sixcat 90.2 (Truth 86, Code 95.7, Knowledge 89.8, Math 97, Instruct 88, Tools 85): no worse than stock
   Flare on either, one sixcat run each. The gap to the default stays in Truth, Instruct and Tools.
-- **Neither engine repeats itself exactly at temperature 0, Flare least.** Over 3 runs the default gave the same
-  text on 2 of its 3 decode prompts and vllm-0.32 on none; over 5 runs Flare gave 5 different texts for every
-  prompt. Flare's texts part early enough to move decode speed by up to 10% between runs, vLLM's by about 3%.
+- **Flare samples where vLLM decodes greedily.** Flare raises `temperature: 0` to the recipe's minimum, 0.7 for
+  Qwen3.8, with top-k 20 and top-p 0.95 (Flare's `docs/api.md`): it has no greedy decoding. Over 5 runs it gave
+  5 different texts for every prompt, enough to move decode speed by up to 10% between runs. vLLM is greedy and
+  still not bit-exact: over 3 runs the default gave the same text on 2 of its 3 decode prompts, vllm-0.32 on
+  none, with decode varying by about 3%.
 - **Flare has no prompt logprobs** (`echo` with `logprobs` answers HTTP 400), so it has no perplexity here.
 
 #### Flare decode settings
@@ -710,7 +716,7 @@ docker run -d --name flare-qwen38 --gpus all --ipc host --network host --ulimit 
 ### Prefix cache
 
 Both servers keep finished prompts so that a later request repeating a prefix skips recomputing it. One request
-at a time, chat completions, thinking off, temperature 0, 64 output tokens. Each scenario is its own pair: a cold
+at a time, chat completions, thinking off, temperature 0 (0.7 on Flare), 64 output tokens. Each scenario is its own pair: a cold
 request on a fresh document (an llm_context_benchmarks prose file behind a unique first line), then the
 follow-up. Reused tokens are what each server reports: vLLM's prefix-cache hit counter, Flare's
 `cached_tokens`. Flare ran with 3 drafts, fixed width; vllm-0.32 is in the last bullet. Flare with the MXFP8 head
@@ -735,9 +741,9 @@ when the document was re-sent with a new question.
   has no state there and pays the full prefill again, 62 s at 128k. The default resumes from the last GDN state
   it kept inside the document (4,096, 24,576 and 122,880 tokens in) and recomputes the rest: 2.1, 3.9 and 4.0 s.
   For reuse on both, send a document that comes back with each question as the system message.
-- **A cached answer can differ.** At temperature 0 the repeated request answered differently from the cold one
-  on Flare at all three sizes (from character 27-95), with the MXFP8 head too, on the default at 8k
-  (character 159) and on vllm-0.32 at 128k. Three samples each.
+- **A cached answer can differ.** The repeated request answered differently from the cold one on Flare at all
+  three sizes (from character 27-95), as sampling at 0.7 makes expected, with the MXFP8 head too; and, greedy, on
+  the default at 8k (character 159) and on vllm-0.32 at 128k. Three samples each.
 - **vllm-0.32 reuses the same amount whatever the layout.** Every follow-up reused exactly 6,400, 32,000 and
   128,000 tokens and started in 0.9, 0.6 and 1.4 s at 8k, 32k and 128k: slower than the default on a repeat or
   the next question in a chat (0.45-0.65 s at 128k), faster when a document is re-sent with a new question (1.35 s
